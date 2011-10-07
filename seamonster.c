@@ -1,6 +1,7 @@
 #include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <unistd.h>
 
 #include <arpa/inet.h>
@@ -8,9 +9,11 @@
 #include <sys/socket.h>
 #include <sys/wait.h>
 
-#define DEFAULT_PORT    7070
-#define DEFAULT_BACKLOG 4
-#define DEFAULT_WORKERS 8
+#define DEFAULT_PORT     7070
+#define DEFAULT_BACKLOG  4
+#define DEFAULT_WORKERS  8
+
+#define REQUEST_BUF_SIZE 128
 
 int main(int argc, char **argv);
 
@@ -22,7 +25,10 @@ static void dispose_workers(pid_t *pids);
 
 static int worker_main(int passive_sock);
 
-static void handle_request(int sock);
+static void handle_conn(int sock);
+
+static const char **parse_request(int sock);
+static void free_request(const char **request);
 
 int create_passive_sock(short port, int backlog) {
   int one = 1, sock;
@@ -73,12 +79,12 @@ pid_t *create_workers(size_t num_workers, int passive_sock) {
 
   for (i = 0; i < num_workers; ++i) {
     switch (pids[i] = fork()) {
-      case -1:
-        free(pids);
-        return NULL;
+    case -1:
+      free(pids);
+      return NULL;
 
-      case 0:
-        exit(worker_main(passive_sock));
+    case 0:
+      exit(worker_main(passive_sock));
     }
   }
 
@@ -87,6 +93,89 @@ pid_t *create_workers(size_t num_workers, int passive_sock) {
 
 void dispose_workers(pid_t *pids) {
   free(pids);
+}
+
+const char **parse_request(int sock) {
+  int done = 0;
+  size_t i, num_chunks = 0, buf_size = REQUEST_BUF_SIZE;
+  char *buf_start = NULL, *buf_next = NULL, **request;
+
+  do {
+    size_t buf_off = buf_next - buf_start;
+    ssize_t recv_size;
+
+    if (!(buf_start = realloc(buf_start, buf_size))) {
+      return NULL;
+    }
+
+    buf_size *= 2;
+    buf_next = buf_start + buf_off;
+
+    while ((recv_size = recv(sock, buf_next, REQUEST_BUF_SIZE - 1, 0)) == -1
+        && errno == EINTR);
+
+    if (recv_size == -1) {
+      return NULL;
+    }
+
+    if (!recv_size) {
+      done = 1;
+    }
+
+    do {
+      switch (*buf_next++) {
+      case '\t':
+        ++num_chunks;
+        break;
+
+      case '\r':
+        *(buf_next - 1) = '\0';
+        ++num_chunks;
+        done = 1;
+      }
+    } while (--recv_size);
+  } while (!done);
+
+  if (!(request = malloc((num_chunks + 1) / sizeof(*request)))) {
+    return NULL;
+  }
+
+  for (i = 0; i < num_chunks; ++i) {
+    request[i] = buf_start;
+    buf_start = strchr(buf_start, '\t');
+
+    if (buf_start) {
+      *buf_start++ = '\0';
+    }
+  }
+
+  request[num_chunks] = NULL;
+
+  return (const char **) request;
+}
+
+void free_request(const char **request) {
+  if (request) {
+    free((void *) *request);
+  }
+  free(request);
+}
+
+void handle_conn(int sock) {
+  const char **request, **request_iter;
+
+  if (!(request = parse_request(sock))) {
+    perror("Couldn't read or parse request");
+    return;
+  }
+
+  for (request_iter = request; *request_iter; ++request_iter) {
+    send(sock, "i", 1, 0);
+    send(sock, *request_iter, strlen(*request_iter), 0);
+    send(sock, "\r\n", 2, 0);
+  }
+
+  free_request(request);
 }
 
 int worker_main(int passive_sock) {
@@ -104,7 +193,7 @@ int worker_main(int passive_sock) {
     }
 
     /* Handle the new client connection. */
-    handle_request(conn_sock);
+    handle_conn(conn_sock);
 
     /* Close the client connection's socket. */
     while ((ret = close(conn_sock) == -1 && errno == EINTR));
@@ -113,11 +202,6 @@ int worker_main(int passive_sock) {
       perror("Couldn't close connection socket");
     }
   }
-}
-
-void handle_request(int sock) {
-  char msg[] = "iHello, world of Gopher!\n.\n";
-  send(sock, msg, sizeof(msg), 0);
 }
 
 int main(int argc, char **argv) {
