@@ -30,31 +30,20 @@ static void handle_conn(int sock);
 static const char **parse_request(int sock);
 static void free_request(const char **request);
 
+static const int one = 1;
+
 int create_passive_sock(short port, int backlog) {
-  int one = 1, sock;
+  int sock;
   struct sockaddr_in addr = { 0 };
-
-  if ((sock = socket(PF_INET, SOCK_STREAM, 0)) == -1) {
-    return -1;
-  }
-
-  if (setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one)) == -1) {
-    return -1;
-  }
 
   addr.sin_family = AF_INET;
   addr.sin_port = htons(port);
   addr.sin_addr.s_addr = htonl(INADDR_ANY);
 
-  if (bind(sock, (struct sockaddr *) &addr, sizeof(addr)) == -1) {
-    return -1;
-  }
-
-  if (listen(sock, backlog) == -1) {
-    return -1;
-  }
-
-  return sock;
+  return ((sock = socket(PF_INET, SOCK_STREAM, 0)) != -1 &&
+      !setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one)) &&
+      !bind(sock, (struct sockaddr *) &addr, sizeof(addr)) &&
+      !listen(sock, backlog)) ? sock : -1;
 }
 
 void dispose_passive_sock(int sock) {
@@ -97,46 +86,61 @@ void dispose_workers(pid_t *pids) {
 
 const char **parse_request(int sock) {
   int done = 0;
-  size_t i, num_chunks = 0, buf_size = REQUEST_BUF_SIZE;
-  char *buf_start = NULL, *buf_next = NULL, **request;
+  size_t i, num_chunks = 1;
+  char *buf_start = NULL, *buf_next = NULL, *buf_end = NULL, **request;
 
   do {
-    size_t buf_off = buf_next - buf_start;
     ssize_t recv_size;
 
-    if (!(buf_start = realloc(buf_start, buf_size))) {
-      return NULL;
+    if (buf_next == buf_end) {
+      size_t data_size = buf_next - buf_start, buf_size;
+
+      buf_size = buf_start ? buf_end - buf_start : REQUEST_BUF_SIZE;
+
+      if (!(buf_start = realloc(buf_start, buf_size * 2))) {
+        return NULL;
+      }
+
+      buf_next = buf_start + data_size;
+      buf_end = buf_start + buf_size * 2;
     }
 
-    buf_size *= 2;
-    buf_next = buf_start + buf_off;
-
-    while ((recv_size = recv(sock, buf_next, REQUEST_BUF_SIZE - 1, 0)) == -1
+    while ((recv_size = recv(sock, buf_next, buf_end - buf_next, 0)) == -1
         && errno == EINTR);
 
     if (recv_size == -1) {
+      free(buf_start);
       return NULL;
     }
 
-    if (!recv_size) {
+    switch(recv_size) {
+    case -1:
+      free(buf_start);
+      return NULL;
+
+    case 0:
+      free(buf_start);
+      num_chunks = 0;
       done = 1;
+      break;
+
+    default:
+      do {
+        switch (*buf_next++) {
+        case '\t':
+          ++num_chunks;
+          break;
+
+        case '\r':
+          *(buf_next - 1) = '\0';
+          done = 1;
+        }
+      } while (--recv_size && !done);
     }
-
-    do {
-      switch (*buf_next++) {
-      case '\t':
-        ++num_chunks;
-        break;
-
-      case '\r':
-        *(buf_next - 1) = '\0';
-        ++num_chunks;
-        done = 1;
-      }
-    } while (--recv_size);
   } while (!done);
 
-  if (!(request = malloc((num_chunks + 1) / sizeof(*request)))) {
+  if (!(request = malloc((num_chunks + 1) * sizeof(*request)))) {
+    free(buf_start);
     return NULL;
   }
 
