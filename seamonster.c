@@ -396,6 +396,7 @@ void handle_conn(const struct config *p_config, int sock, pid_t pid,
 cleanup:
   if (err_msg) {
     r_write(sock, err_msg, strlen(err_msg));
+    r_write(sock, RESPONSE_EOM, sizeof(RESPONSE_EOM));
   }
 
   free(path);
