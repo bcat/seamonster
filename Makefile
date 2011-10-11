@@ -1,4 +1,4 @@
-CFLAGS = -pedantic -Wall -Werror
+CFLAGS = -pedantic -Wall -Wno-missing-braces -Werror
 
 objs = seamonster.o
 exec = seamonster

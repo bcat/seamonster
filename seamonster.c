@@ -1,6 +1,7 @@
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <signal.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -404,7 +405,18 @@ cleanup:
 }
 
 int worker_main(const struct config *p_config, int passive_sock, pid_t pid) {
+  struct sigaction sig = { 0 };
+
   worker_printf(pid, NULL, "Spawned worker process", (long)pid);
+
+  /* Ignore SIGPIPE so the worker doesn't die if the client closes the
+   * connection prematurely. */
+  sig.sa_handler = SIG_IGN;
+
+  if (sigaction(SIGPIPE, &sig, NULL)) {
+    worker_perror(pid, NULL, "Couldn't ignore SIGPIPE");
+    return 1;
+  }
 
   /* Process connections until interrupted the parent is interrupted. */
   for (;;) {
