@@ -14,18 +14,22 @@
 #include <sys/stat.h>
 #include <sys/wait.h>
 
-#define DEFAULT_HOSTNAME  "localhost"
-#define DEFAULT_PORT      7070
-#define DEFAULT_BACKLOG   256
-#define DEFAULT_WORKERS   4
-#define DEFAULT_SRV_PATH  "."
+#define DEFAULT_HOSTNAME   "localhost"
+#define DEFAULT_PORT       7070
+#define DEFAULT_BACKLOG    256
+#define DEFAULT_WORKERS    4
+#define DEFAULT_SRV_PATH   "."
 
-#define REQUEST_BUF_SIZE  128
-#define RESOURCE_BUF_SIZE 4096
+#define REQUEST_BUF_SIZE   256
+#define RESPONSE_BUF_SIZE  4096
+#define DIRENTRY_BUF_SIZE  592
 
-#define RESPONSE_EOM      ".\r\n"
-#define RESPONSE_ERR_OPEN "3Error opening resource\tinvalid.invalid\t70\r\n"
-#define RESPONSE_ERR_READ "3Error reading resource\tinvalid.invalid\t70\r\n"
+#define RESPONSE_EOM       ".\r\n"
+#define RESPONSE_ERR_OPEN  "3Error opening resource\tinvalid.invalid\t70\r\n"
+#define RESPONSE_ERR_READ  "3Error reading resource\tinvalid.invalid\t70\r\n"
+
+#define RESPONSE_TYPE_TEXT "0"
+#define RESPONSE_TYPE_MENU "1"
 
 struct config {
   const char *hostname;
@@ -47,6 +51,9 @@ static int worker_printf(pid_t pid, const char *addr_buf, const char *format,
     ...);
 static int worker_perror(pid_t pid, const char *addr_buf, const char *s);
 
+static int sanitize_path(const struct config *p_config, const char *in_path,
+    char **out_path);
+
 static struct config *parse_config(int argc, char **argv);
 static void free_config(const struct config *p_config);
 
@@ -56,18 +63,23 @@ static void dispose_passive_sock(int sock);
 static pid_t *create_workers(const struct config *p_config, int passive_sock);
 static void dispose_workers(pid_t *pids);
 
-static int worker_main(const struct config *p_config, int passive_sock,
-    pid_t pid);
+static const char **parse_request(int sock);
+static void free_request(const char **request);
+
+static const char *serve_text_file(const struct config *p_config,
+    const char *path, int sock, pid_t pid, const char *addr_buf);
+
+static int menu_filter(const struct dirent *p_dirent);
+static int menu_sort(const struct dirent **pp_dirent1,
+    const struct dirent **pp_dirent2);
+static const char *serve_menu(const struct config *p_config,
+    const char *path, int sock, pid_t pid, const char *addr_buf);
 
 static void handle_conn(const struct config *p_config, int sock, pid_t pid,
     const char *addr_buf);
-static const char *serve_text_file(const char *path, int sock, pid_t pid,
-    const char *addr_buf);
-static const char *serve_menu(const char *path, int sock, pid_t pid,
-    const char *addr_buf);
 
-static const char **parse_request(int sock);
-static void free_request(const char **request);
+static int worker_main(const struct config *p_config, int passive_sock,
+    pid_t pid);
 
 static const int one = 1;
 
@@ -95,30 +107,52 @@ ssize_t r_write(int fildes, const void *buf, size_t nbytes) {
 }
 
 int worker_printf(pid_t pid, const char *addr_buf, const char *format, ...) {
-  char buf[PIPE_BUF];
-  int i, j = 0, k;
+  char buf[50], *buf_next = buf;
+  int buf_size = sizeof(buf), str_size;
   va_list varargs;
 
-  va_start(varargs, format);
-
-  if ((i = snprintf(buf, sizeof(buf), "[%ld] ", (long) pid)) == -1
-      || (addr_buf
-          && (j = snprintf(buf + i, sizeof(buf) - i, "%s - ", addr_buf))
-              == -1)
-      || (k = vsnprintf(buf + i + j, sizeof(buf) - i - j, format, varargs))
-          == -1) {
+  if ((str_size = snprintf(buf_next, buf_size, "[%ld] ", (long) pid)) == -1) {
     return -1;
   }
+  buf_next += (str_size < buf_size) ? str_size : buf_size;
+  buf_size -= (str_size < buf_size) ? str_size : buf_size;
 
+  if (addr_buf) {
+    if ((str_size = snprintf(buf_next, buf_size, "%s - ", addr_buf)) == -1) {
+      return -1;
+    }
+    buf_next += (str_size < buf_size) ? str_size : buf_size;
+    buf_size -= (str_size < buf_size) ? str_size : buf_size;
+  }
+
+  va_start(varargs, format);
+  if ((str_size = vsnprintf(buf_next, buf_size, format, varargs)) == -1) {
+    return -1;
+  }
   va_end(varargs);
+  buf_next += (str_size < buf_size) ? str_size : buf_size;
 
-  buf[i + j + k] = '\n';
+  *buf_next++ = '\n';
 
-  return r_write(STDERR_FILENO, buf, i + j + k + 1);
+  return r_write(STDERR_FILENO, buf, buf_next - buf);
 }
 
 int worker_perror(pid_t pid, const char *addr_buf, const char *s) {
   return worker_printf(pid, addr_buf, "%s: %s", s, strerror(errno));
+}
+
+int sanitize_path(const struct config *p_config, const char *in_path,
+    char **out_path) {
+  if (!(*out_path = realpath(in_path, NULL))) {
+    return -1;
+  }
+
+  if (strstr(*out_path, p_config->srv_path) != *out_path) {
+    free(*out_path);
+    *out_path = NULL;
+  }
+
+  return 0;
 }
 
 struct config *parse_config(int argc, char **argv) {
@@ -274,10 +308,10 @@ void free_request(const char **request) {
   free(request);
 }
 
-const char *serve_text_file(const char *path, int sock, pid_t pid,
-    const char *addr_buf) {
+const char *serve_text_file(const struct config *p_config, const char *path,
+    int sock, pid_t pid, const char *addr_buf) {
   const char *err_msg = NULL;
-  char buf[RESOURCE_BUF_SIZE];
+  char buf[RESPONSE_BUF_SIZE];
   ssize_t data_size;
   int file;
 
@@ -317,37 +351,115 @@ cleanup:
   return err_msg;
 }
 
-/*int menu_filter(const struct dirent *p_dirent, pid) {
+int menu_filter(const struct dirent *p_dirent) {
   const char *name = p_dirent->d_name;
   char ch;
-  int i;
 
-  while (ch = *name++) {
-    for (i = 0; i < sizeof(BAD_
+  if (name[0] == '.' && name[1] == '\0') {
+    return 0;
+  }
+
+  while ((ch = *name++)) {
+    if (ch == '\t' || ch == '\r' || ch == '\n') {
+      return 0;
+    }
   }
 
   return 1;
-}*/
+}
 
-const char *serve_menu(const char *path, int sock, pid_t pid,
-    const char *addr_buf) {
+int menu_sort(const struct dirent **pp_dirent1,
+    const struct dirent **pp_dirent2) {
+  const char *name1 = (*pp_dirent1)->d_name, *name2 = (*pp_dirent2)->d_name;
+
+  if (!strcmp(name1, "..")) {
+    return !!strcmp(name2, "..");
+  } else {
+    return strcoll(name1, name2);
+  }
+}
+
+const char *serve_menu(const struct config *p_config, const char *path,
+    int sock, pid_t pid, const char *addr_buf) {
   const char *err_msg = NULL;
-  /*struct dirent **p_dirents = NULL;
+  struct dirent **p_dirents = NULL;
   int num_dirents;
 
-  if ((num_dirents = scandir(path, &p_dirents, menu_filter, alphasort))
+  if ((num_dirents = scandir(path, &p_dirents, menu_filter, menu_sort))
       == -1) {
     worker_perror(pid, addr_buf, "Couldn't scan resource directory");
     err_msg = RESPONSE_ERR_OPEN;
     goto cleanup;
   }
 
-  while (num_dirents--) {
-    r_write(sock,
+  while (num_dirents-- && !err_msg) {
+    const char *file_name = p_dirents[num_dirents]->d_name;
+    int direntry_size;
+    struct stat path_stat;
+    char *file_path = NULL, *sanitized_path = NULL,
+         direntry_buf[DIRENTRY_BUF_SIZE];
+
+    if (!(file_path = malloc(strlen(path) + strlen(file_name) + 2))) {
+      worker_perror(pid, addr_buf, "Couldn't allocate file path");
+      err_msg = RESPONSE_ERR_READ;
+      goto inner_cleanup;
+    }
+
+    strcpy(file_path, path);
+    strcat(file_path, "/");
+    strcat(file_path, file_name);
+
+    if (sanitize_path(p_config, file_path, &sanitized_path)) {
+      worker_perror(pid, addr_buf, "Couldn't sanitize file path");
+      err_msg = RESPONSE_ERR_READ;
+      goto inner_cleanup;
+    }
+
+    if (!sanitized_path) {
+      goto inner_cleanup;
+    }
+
+    if (stat(sanitized_path, &path_stat)) {
+      worker_perror(pid, addr_buf, "Couldn't stat file path");
+      err_msg = RESPONSE_ERR_READ;
+      goto inner_cleanup;
+    }
+
+    if ((direntry_size = snprintf(
+            direntry_buf,
+            sizeof(direntry_buf),
+            "%s%s\t%s\t%s\t%hd\r\n",
+            S_ISDIR(path_stat.st_mode)
+                ? RESPONSE_TYPE_MENU
+                : RESPONSE_TYPE_TEXT,
+            file_name,
+            file_name,
+            p_config->hostname,
+            p_config->port)) == -1) {
+      worker_perror(pid, addr_buf, "Couldn't format menu entry");
+      err_msg = RESPONSE_ERR_READ;
+      goto inner_cleanup;
+    }
+
+    if (r_write(sock, direntry_buf, direntry_size) == -1) {
+      worker_perror(pid, addr_buf, "Couldn't send menu entry to client");
+      err_msg = RESPONSE_ERR_READ;
+      goto inner_cleanup;
+    }
+
+  inner_cleanup:
+    free(file_path);
+    free(sanitized_path);
+    free(p_dirents[num_dirents]);
+  }
+
+  if (r_write(sock, RESPONSE_EOM, sizeof(RESPONSE_EOM)) == -1) {
+    worker_perror(pid, addr_buf, "Couldn't send resource to client");
+    goto cleanup;
   }
 
 cleanup:
-  if (*/
+  free(p_dirents);
 
   return err_msg;
 }
@@ -356,7 +468,7 @@ void handle_conn(const struct config *p_config, int sock, pid_t pid,
     const char *addr_buf) {
   const char **request = NULL, **request_iter, *selector, *err_msg = NULL;
   struct stat path_stat;
-  char *path = NULL;
+  char *path = NULL, *sanitized_path = NULL;
 
   if (!(request_iter = request = parse_request(sock))) {
     worker_perror(pid, addr_buf, "Couldn't read or parse request");
@@ -368,8 +480,6 @@ void handle_conn(const struct config *p_config, int sock, pid_t pid,
     goto cleanup;
   }
 
-  worker_printf(pid, addr_buf, "Accepted request for `%s`", selector);
-
   if (!(path = malloc(strlen(p_config->srv_path) + strlen(selector) + 2))) {
     worker_perror(pid, addr_buf, "Couldn't allocate resource path");
     goto cleanup;
@@ -379,15 +489,30 @@ void handle_conn(const struct config *p_config, int sock, pid_t pid,
   strcat(path, "/");
   strcat(path, selector);
 
-  if (stat(path, &path_stat)) {
+  if (sanitize_path(p_config, path, &sanitized_path)) {
+    worker_perror(pid, addr_buf, "Couldn't sanitize resource path");
+    err_msg = RESPONSE_ERR_OPEN;
+    goto cleanup;
+  }
+
+  worker_printf(pid, addr_buf, "Accepted request for `%s` (`%s`)",
+      selector, sanitized_path);
+
+  if (!sanitized_path) {
+    worker_printf(pid, addr_buf, "Selector references forbidden resource");
+    err_msg = RESPONSE_ERR_OPEN;
+    goto cleanup;
+  }
+
+  if (stat(sanitized_path, &path_stat)) {
     worker_perror(pid, addr_buf, "Couldn't stat resource path");
     err_msg = RESPONSE_ERR_OPEN;
     goto cleanup;
   }
 
   err_msg = S_ISDIR(path_stat.st_mode)
-      ? serve_menu(path, sock, pid, addr_buf)
-      : serve_text_file(path, sock, pid, addr_buf);
+      ? serve_menu(p_config, sanitized_path, sock, pid, addr_buf)
+      : serve_text_file(p_config, sanitized_path, sock, pid, addr_buf);
 
   if (*request_iter) {
     worker_printf(pid, addr_buf, "Request contains unexpected element");
@@ -400,6 +525,7 @@ cleanup:
     r_write(sock, RESPONSE_EOM, sizeof(RESPONSE_EOM));
   }
 
+  free(sanitized_path);
   free(path);
   free_request(request);
 }
@@ -407,6 +533,7 @@ cleanup:
 int worker_main(const struct config *p_config, int passive_sock, pid_t pid) {
   struct sigaction sig = { 0 };
 
+  /* Print a message containing the worker's PID. */
   worker_printf(pid, NULL, "Spawned worker process", (long)pid);
 
   /* Ignore SIGPIPE so the worker doesn't die if the client closes the
@@ -434,6 +561,7 @@ int worker_main(const struct config *p_config, int passive_sock, pid_t pid) {
       return 1;
     }
 
+    /* Format the client's IP address as a string. */
     if (!inet_ntop(AF_INET, &addr.sin_addr, addr_buf, sizeof(addr_buf))) {
       worker_perror(pid, NULL, "Couldn't format remote IP address");
       return 1;
@@ -454,7 +582,7 @@ int main(int argc, char **argv) {
   const struct config *p_config = NULL;
   pid_t *worker_pids = NULL;
 
-  /* TODO: Parse command line arguments/configuration file. */
+  /* TODO: Parse command line arguments. */
   if (!(p_config = parse_config(argc, argv))) {
     perror("Couldn't parse server configuration");
     exit_status = 1;
