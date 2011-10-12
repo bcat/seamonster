@@ -1,4 +1,5 @@
 CFLAGS = -pedantic -Wall -Wno-missing-braces -Werror
+LDFLAGS = -lmagic
 
 objs = seamonster.o
 exec = seamonster

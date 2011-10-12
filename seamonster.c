@@ -1,6 +1,9 @@
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <grp.h>
+#include <magic.h>
+#include <pwd.h>
 #include <signal.h>
 #include <stdarg.h>
 #include <stdio.h>
@@ -14,27 +17,33 @@
 #include <sys/stat.h>
 #include <sys/wait.h>
 
-#define DEFAULT_HOSTNAME   "localhost"
-#define DEFAULT_PORT       7070
-#define DEFAULT_BACKLOG    256
-#define DEFAULT_WORKERS    4
-#define DEFAULT_SRV_PATH   "."
+#define DEFAULT_HOSTNAME  "localhost"
+#define DEFAULT_PORT      7070
+#define DEFAULT_BACKLOG   256
+#define DEFAULT_USER      "nobody"
+#define DEFAULT_WORKERS   4
+#define DEFAULT_SRV_PATH  "."
 
-#define REQUEST_BUF_SIZE   256
-#define RESPONSE_BUF_SIZE  4096
-#define DIRENTRY_BUF_SIZE  592
+#define REQUEST_BUF_SIZE  256
+#define RESPONSE_BUF_SIZE 4096
+#define DIRENTRY_BUF_SIZE 592
 
-#define RESPONSE_EOM       ".\r\n"
-#define RESPONSE_ERR_OPEN  "3Error opening resource\tinvalid.invalid\t70\r\n"
-#define RESPONSE_ERR_READ  "3Error reading resource\tinvalid.invalid\t70\r\n"
+#define RESPONSE_EOM      ".\r\n"
+#define RESPONSE_ERR_OPEN "3Error opening resource\tinvalid.invalid\t70\r\n"
+#define RESPONSE_ERR_READ "3Error reading resource\tinvalid.invalid\t70\r\n"
 
-#define RESPONSE_TYPE_TEXT "0"
-#define RESPONSE_TYPE_MENU "1"
+#define ITEM_TYPE_TXT      '0'
+#define ITEM_TYPE_DIR      '1'
+#define ITEM_TYPE_BIN      '9'
+#define ITEM_TYPE_GIF      'g'
+#define ITEM_TYPE_IMG      'I'
 
 struct config {
   const char *hostname;
   short port;
   int backlog;
+
+  const char *user;
 
   size_t num_workers;
 
@@ -51,23 +60,27 @@ static int worker_printf(pid_t pid, const char *addr_buf, const char *format,
     ...);
 static int worker_perror(pid_t pid, const char *addr_buf, const char *s);
 
-static int sanitize_path(const struct config *p_config, const char *in_path,
-    char **out_path);
-
 static struct config *parse_config(int argc, char **argv);
 static void free_config(const struct config *p_config);
 
 static int create_passive_sock(const struct config *p_config);
 static void dispose_passive_sock(int sock);
 
+static int drop_privs(const struct config *p_config);
+
 static pid_t *create_workers(const struct config *p_config, int passive_sock);
+static pid_t start_worker(const struct config *p_config, int passive_sock);
 static void dispose_workers(pid_t *pids);
 
 static const char **parse_request(int sock);
 static void free_request(const char **request);
 
-static const char *serve_text_file(const struct config *p_config,
-    const char *path, int sock, pid_t pid, const char *addr_buf);
+static int sanitize_path(const struct config *p_config, const char *in_path,
+    char **out_path);
+static char get_item_type(const char *path);
+
+static const char *serve_file(const struct config *p_config, const char *path,
+    int sock, pid_t pid, const char *addr_buf, int is_txt);
 
 static int menu_filter(const struct dirent *p_dirent);
 static int menu_sort(const struct dirent **pp_dirent1,
@@ -81,7 +94,11 @@ static void handle_conn(const struct config *p_config, int sock, pid_t pid,
 static int worker_main(const struct config *p_config, int passive_sock,
     pid_t pid);
 
+static void sigterm_handler(int signum);
+
 static const int one = 1;
+
+static volatile sig_atomic_t terminating;
 
 int r_close(int fildes) {
   int ret;
@@ -107,7 +124,7 @@ ssize_t r_write(int fildes, const void *buf, size_t nbytes) {
 }
 
 int worker_printf(pid_t pid, const char *addr_buf, const char *format, ...) {
-  char buf[50], *buf_next = buf;
+  char buf[PIPE_BUF], *buf_next = buf;
   int buf_size = sizeof(buf), str_size;
   va_list varargs;
 
@@ -141,20 +158,6 @@ int worker_perror(pid_t pid, const char *addr_buf, const char *s) {
   return worker_printf(pid, addr_buf, "%s: %s", s, strerror(errno));
 }
 
-int sanitize_path(const struct config *p_config, const char *in_path,
-    char **out_path) {
-  if (!(*out_path = realpath(in_path, NULL))) {
-    return -1;
-  }
-
-  if (strstr(*out_path, p_config->srv_path) != *out_path) {
-    free(*out_path);
-    *out_path = NULL;
-  }
-
-  return 0;
-}
-
 struct config *parse_config(int argc, char **argv) {
   struct config *p_config;
 
@@ -165,6 +168,7 @@ struct config *parse_config(int argc, char **argv) {
   p_config->hostname = DEFAULT_HOSTNAME;
   p_config->port = DEFAULT_PORT;
   p_config->backlog = DEFAULT_BACKLOG;
+  p_config->user = DEFAULT_USER;
   p_config->num_workers = DEFAULT_WORKERS;
 
   if (!(p_config->srv_path = realpath(DEFAULT_SRV_PATH, NULL))) {
@@ -178,6 +182,17 @@ struct config *parse_config(int argc, char **argv) {
 void free_config(const struct config *p_config) {
   free((void *) p_config->srv_path);
   free((void *) p_config);
+}
+
+int drop_privs(const struct config *p_config) {
+  struct passwd *p_passwd;
+
+  errno = 0;
+
+  return (!(p_passwd = getpwnam(p_config->user))
+      || setgid(p_passwd->pw_gid)
+      || setgroups(0, NULL)
+      || setuid(p_passwd->pw_uid)) ? -1 : 0;
 }
 
 int create_passive_sock(const struct config *p_config) {
@@ -203,7 +218,7 @@ void dispose_passive_sock(int sock) {
 }
 
 pid_t *create_workers(const struct config *p_config, int passive_sock) {
-  size_t i;
+  size_t i, j;
   pid_t *pids = malloc(p_config->num_workers * sizeof(pid_t));
 
   if (!pids) {
@@ -211,17 +226,26 @@ pid_t *create_workers(const struct config *p_config, int passive_sock) {
   }
 
   for (i = 0; i < p_config->num_workers; ++i) {
-    switch (pids[i] = fork()) {
-    case -1:
+    if ((pids[i] = start_worker(p_config, passive_sock)) == -1) {
+      for (j = 0; i < i; ++j) {
+        kill(pids[j], SIGTERM);
+      }
       free(pids);
       return NULL;
-
-    case 0:
-      exit(worker_main(p_config, passive_sock, getpid()));
     }
   }
 
   return pids;
+}
+
+pid_t start_worker(const struct config *p_config, int passive_sock) {
+  pid_t pid;
+
+  if (!(pid = fork())) {
+    exit(worker_main(p_config, passive_sock, getpid()));
+  }
+
+  return pid;
 }
 
 void dispose_workers(pid_t *pids) {
@@ -308,8 +332,60 @@ void free_request(const char **request) {
   free(request);
 }
 
-const char *serve_text_file(const struct config *p_config, const char *path,
-    int sock, pid_t pid, const char *addr_buf) {
+int sanitize_path(const struct config *p_config, const char *in_path,
+    char **out_path) {
+  if (!(*out_path = realpath(in_path, NULL))) {
+    return -1;
+  }
+
+  if (strstr(*out_path, p_config->srv_path) != *out_path) {
+    free(*out_path);
+    *out_path = NULL;
+  }
+
+  return 0;
+}
+
+char get_item_type(const char *path) {
+  char item_type = ITEM_TYPE_BIN;
+  const char *mime_type = NULL;
+  struct stat path_stat;
+  magic_t cookie = NULL;
+
+  if (stat(path, &path_stat)) {
+    goto cleanup;
+  }
+
+  if (S_ISDIR(path_stat.st_mode)) {
+    item_type = ITEM_TYPE_DIR;
+    goto cleanup;
+  }
+
+  if (!(cookie = magic_open(MAGIC_MIME_TYPE))
+      || magic_load(cookie, NULL)
+      || !(mime_type = magic_file(cookie, path))) {
+    item_type = '\0';
+    goto cleanup;
+  }
+
+  if (strstr(mime_type, "text/") == mime_type) {
+    item_type = ITEM_TYPE_TXT;
+  } else if (strstr(mime_type, "image/") == mime_type) {
+    item_type = !strcmp(mime_type + sizeof("image/") - 1, "gif")
+        ? ITEM_TYPE_GIF
+        : ITEM_TYPE_IMG;
+  }
+
+cleanup:
+  if (cookie) {
+    magic_close(cookie);
+  }
+
+  return item_type;
+}
+
+const char *serve_file(const struct config *p_config, const char *path,
+    int sock, pid_t pid, const char *addr_buf, int is_txt) {
   const char *err_msg = NULL;
   char buf[RESPONSE_BUF_SIZE];
   ssize_t data_size;
@@ -336,9 +412,11 @@ const char *serve_text_file(const struct config *p_config, const char *path,
     }
   }
 
-  if (r_write(sock, RESPONSE_EOM, sizeof(RESPONSE_EOM)) == -1) {
-    worker_perror(pid, addr_buf, "Couldn't send resource to client");
-    goto cleanup;
+  if (is_txt) {
+    if (r_write(sock, RESPONSE_EOM, sizeof(RESPONSE_EOM)) == -1) {
+      worker_perror(pid, addr_buf, "Couldn't send resource to client");
+      goto cleanup;
+    }
   }
 
 cleanup:
@@ -382,6 +460,7 @@ int menu_sort(const struct dirent **pp_dirent1,
 const char *serve_menu(const struct config *p_config, const char *path,
     int sock, pid_t pid, const char *addr_buf) {
   const char *err_msg = NULL;
+  char item_type;
   struct dirent **p_dirents = NULL;
   int num_dirents;
 
@@ -395,7 +474,6 @@ const char *serve_menu(const struct config *p_config, const char *path,
   while (num_dirents-- && !err_msg) {
     const char *file_name = p_dirents[num_dirents]->d_name;
     int direntry_size;
-    struct stat path_stat;
     char *file_path = NULL, *sanitized_path = NULL,
          direntry_buf[DIRENTRY_BUF_SIZE];
 
@@ -419,8 +497,8 @@ const char *serve_menu(const struct config *p_config, const char *path,
       goto inner_cleanup;
     }
 
-    if (stat(sanitized_path, &path_stat)) {
-      worker_perror(pid, addr_buf, "Couldn't stat file path");
+    if (!(item_type = get_item_type(sanitized_path))) {
+      worker_perror(pid, addr_buf, "Couldn't determine item type");
       err_msg = RESPONSE_ERR_READ;
       goto inner_cleanup;
     }
@@ -428,12 +506,10 @@ const char *serve_menu(const struct config *p_config, const char *path,
     if ((direntry_size = snprintf(
             direntry_buf,
             sizeof(direntry_buf),
-            "%s%s\t%s\t%s\t%hd\r\n",
-            S_ISDIR(path_stat.st_mode)
-                ? RESPONSE_TYPE_MENU
-                : RESPONSE_TYPE_TEXT,
+            "%c%.70s\t%.255s\t%.255s\t%hd\r\n",
+            item_type,
             file_name,
-            file_name,
+            sanitized_path + strlen(p_config->srv_path) + 1,
             p_config->hostname,
             p_config->port)) == -1) {
       worker_perror(pid, addr_buf, "Couldn't format menu entry");
@@ -467,8 +543,7 @@ cleanup:
 void handle_conn(const struct config *p_config, int sock, pid_t pid,
     const char *addr_buf) {
   const char **request = NULL, **request_iter, *selector, *err_msg = NULL;
-  struct stat path_stat;
-  char *path = NULL, *sanitized_path = NULL;
+  char *path = NULL, *sanitized_path = NULL, item_type;
 
   if (!(request_iter = request = parse_request(sock))) {
     worker_perror(pid, addr_buf, "Couldn't read or parse request");
@@ -495,24 +570,24 @@ void handle_conn(const struct config *p_config, int sock, pid_t pid,
     goto cleanup;
   }
 
-  worker_printf(pid, addr_buf, "Accepted request for `%s` (`%s`)",
-      selector, sanitized_path);
+  worker_printf(pid, addr_buf, "Accepted request for `%s` (%s)",
+      selector, sanitized_path ? sanitized_path : "forbidden");
 
   if (!sanitized_path) {
-    worker_printf(pid, addr_buf, "Selector references forbidden resource");
     err_msg = RESPONSE_ERR_OPEN;
     goto cleanup;
   }
 
-  if (stat(sanitized_path, &path_stat)) {
-    worker_perror(pid, addr_buf, "Couldn't stat resource path");
+  if (!(item_type = get_item_type(sanitized_path))) {
+    worker_perror(pid, addr_buf, "Couldn't determine item type");
     err_msg = RESPONSE_ERR_OPEN;
     goto cleanup;
   }
 
-  err_msg = S_ISDIR(path_stat.st_mode)
+  err_msg = (item_type == ITEM_TYPE_DIR)
       ? serve_menu(p_config, sanitized_path, sock, pid, addr_buf)
-      : serve_text_file(p_config, sanitized_path, sock, pid, addr_buf);
+      : serve_file(p_config, sanitized_path, sock, pid, addr_buf,
+          item_type == ITEM_TYPE_TXT);
 
   if (*request_iter) {
     worker_printf(pid, addr_buf, "Request contains unexpected element");
@@ -536,8 +611,8 @@ int worker_main(const struct config *p_config, int passive_sock, pid_t pid) {
   /* Print a message containing the worker's PID. */
   worker_printf(pid, NULL, "Spawned worker process", (long)pid);
 
-  /* Ignore SIGPIPE so the worker doesn't die if the client closes the
-   * connection prematurely. */
+  /* Restore the default SIGTERM handler, and ignore SIGPIPE so the worker
+   * doesn't die if the client closes the connection prematurely. */
   sig.sa_handler = SIG_IGN;
 
   if (sigaction(SIGPIPE, &sig, NULL)) {
@@ -545,16 +620,18 @@ int worker_main(const struct config *p_config, int passive_sock, pid_t pid) {
     return 1;
   }
 
-  /* Process connections until interrupted the parent is interrupted. */
-  for (;;) {
+  /* Process connections until we're asked to terminate cleanly. */
+  while (!terminating) {
     int conn_sock;
     struct sockaddr_in addr;
     socklen_t addr_size = sizeof(addr);
     char addr_buf[INET_ADDRSTRLEN];
 
     /* Accept an incoming connection request. */
-    while ((conn_sock = accept(passive_sock, (struct sockaddr *)&addr,
-        &addr_size)) == -1 && errno == EINTR);
+    if ((conn_sock = accept(passive_sock, (struct sockaddr *)&addr,
+        &addr_size)) == -1 && errno == EINTR) {
+      continue;
+    }
 
     if (conn_sock == -1) {
       worker_perror(pid, NULL, "Couldn't accept connection request");
@@ -575,12 +652,29 @@ int worker_main(const struct config *p_config, int passive_sock, pid_t pid) {
       worker_perror(pid, addr_buf, "Couldn't close connection socket");
     }
   }
+
+  return 0;
+}
+
+static void sigterm_handler(int signum) {
+  if (!terminating) {
+    terminating = 1;
+  }
 }
 
 int main(int argc, char **argv) {
   int exit_status = 0, passive_sock = -1;
+  struct sigaction sig = { 0 };
   const struct config *p_config = NULL;
   pid_t *worker_pids = NULL;
+
+  /* Set up signal handling. */
+  sig.sa_handler = sigterm_handler;
+
+  if (sigaction(SIGTERM, &sig, NULL)) {
+    perror("Couldn't set SIGTERM handler");
+    return 1;
+  }
 
   /* TODO: Parse command line arguments. */
   if (!(p_config = parse_config(argc, argv))) {
@@ -596,22 +690,78 @@ int main(int argc, char **argv) {
     goto cleanup;
   }
 
+  fprintf(stderr, "Listening on port %hd\n", p_config->port);
+
+  /* Make sure we aren't running as root after we bind the passive socket. */
+  if (!getuid()) {
+    if (drop_privs(p_config)) {
+      perror("Couldn't drop root privileges");
+      exit_status = 1;
+      goto cleanup;
+    }
+
+    fprintf(stderr, "Dropped root privileges; running as %s\n",
+        p_config->user);
+  }
+
   /* Fork off some children to handle clients. */
+  fprintf(stderr, "Starting with %lu workers\n",
+      (unsigned long) p_config->num_workers);
+
   if (!(worker_pids = create_workers(p_config, passive_sock))) {
     perror("Couldn't fork workers to handle connections");
     exit_status = 1;
     goto cleanup;
   }
 
-  /* Wait for all our children to die. */
+  /* Kill all workers on when the parent terminates cleanly, and restart any
+   * workers that die prematurely. */
   for (;;) {
-    if (wait(NULL) == -1) {
+    size_t i;
+    pid_t worker_pid;
+    int stat_loc;
+
+    /* On SIGTERM, kill all the workers processes. */
+    if (terminating == 1) {
+      fprintf(stderr, "Killing workers on SIGTERM\n");
+
+      for (i = 0; i < p_config->num_workers; ++i) {
+        if (worker_pids[i] != -1) {
+          kill(worker_pids[i], SIGTERM);
+        }
+      }
+
+      terminating = 2;
+    }
+
+    /* Wait for something to happen to a worker. (If there are no more workers
+     * to wait for, then we're done.) */
+    if ((worker_pid = wait(&stat_loc)) == -1) {
       if (errno == ECHILD) {
         break;
       }
 
-      if (errno != EINTR) {
-        perror("Couldn't wait for workers to die");
+      if (errno == EINTR) {
+        continue;
+      }
+
+      perror("Couldn't wait for workers to die");
+      goto cleanup;
+    }
+
+    /* If we aren't currently terminating, then we should restart workers when
+     * they die. */
+    if (!terminating && (WIFEXITED(stat_loc) || WIFSIGNALED(stat_loc))) {
+      fprintf(stderr, "Worker %ld died; restarting\n", (long) worker_pid);
+
+      for (i = 0; i < p_config->num_workers; ++i) {
+        if (worker_pids[i] == worker_pid) {
+          if ((worker_pids[i] = start_worker(p_config, passive_sock)) == -1) {
+            perror("Couldn't restart worker");
+          }
+
+          break;
+        }
       }
     }
   }
