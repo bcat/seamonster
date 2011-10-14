@@ -1,5 +1,6 @@
 #include <dirent.h>
 #include <errno.h>
+#include <getopt.h>
 #include <fcntl.h>
 #include <grp.h>
 #include <magic.h>
@@ -9,6 +10,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <syslog.h>
 #include <unistd.h>
 
 #include <arpa/inet.h>
@@ -18,11 +20,15 @@
 #include <sys/wait.h>
 
 #define DEFAULT_HOSTNAME  "localhost"
-#define DEFAULT_PORT      7070
+#define DEFAULT_PORT      70
 #define DEFAULT_BACKLOG   256
 #define DEFAULT_USER      "nobody"
 #define DEFAULT_WORKERS   4
-#define DEFAULT_SRV_PATH  "."
+#define DEFAULT_SRV_PATH  "/srv/gopher"
+
+#ifndef OPEN_MAX
+# define OPEN_MAX         1024
+#endif
 
 #define REQUEST_BUF_SIZE  256
 #define RESPONSE_BUF_SIZE 4096
@@ -38,7 +44,90 @@
 #define ITEM_TYPE_GIF      'g'
 #define ITEM_TYPE_IMG      'I'
 
-struct config {
+#define USAGE              "Usage: %s [options]\n\n"
+#define USAGE_HELP         "Try %s --help for more information\n"
+
+#define OPT_HELP           '\0'
+#define OPT_VERSION        '\1'
+#define OPT_DAEMON         'd'
+#define OPT_HOST           'h'
+#define OPT_PORT           'p'
+#define OPT_BACKLOG        'b'
+#define OPT_USER           'u'
+#define OPT_WORKERS        'w'
+#define OPT_SRV_PATH       's'
+
+#define OPTSTRING          "dh:p:b:u:w:s:"
+
+static const struct option LONGOPTS[] = {
+  { "help",     0, NULL, OPT_HELP },
+  { "version",  0, NULL, OPT_VERSION },
+  { "daemon",   0, NULL, OPT_DAEMON },
+  { "host",     1, NULL, OPT_HOST },
+  { "port",     1, NULL, OPT_PORT },
+  { "backlog",  1, NULL, OPT_BACKLOG },
+  { "user",     1, NULL, OPT_USER },
+  { "workers",  1, NULL, OPT_WORKERS },
+  { "srv-path", 1, NULL, OPT_SRV_PATH },
+  { 0 }
+};
+
+static const int ONE = 1;
+
+int main(int argc, char **argv);
+
+static int r_close(int fildes);
+static int r_open(const char *path, int oflag, ...);
+static ssize_t r_read(int fildes, void *buf, size_t nbyte);
+static ssize_t r_write(int fildes, const void *buf, size_t nbyte);
+
+static void log_msg(int pri, const char *addr_buf, const char *format,
+    va_list varargs);
+static void log_info(const char *addr_buf, const char *format, ...);
+static void log_warn(const char *addr_buf, const char *format, ...);
+static void log_error(const char *addr_buf, const char *format, ...);
+static void log_perror(const char *addr_buf, const char *s);
+
+static void sigterm_handler(int signum);
+
+static int parse_config(int argc, char **argv);
+static void free_config();
+
+static int daemonize();
+
+static int create_passive_sock();
+static void dispose_passive_sock(int sock);
+
+static int drop_privs();
+
+static pid_t *create_workers(int passive_sock);
+static pid_t start_worker(int passive_sock);
+static void dispose_workers(pid_t *pids);
+
+static const char **parse_request(int sock);
+static void free_request(const char **request);
+
+static int sanitize_path(const char *in_path, char **out_path);
+static char get_item_type(const char *path);
+
+static const char *serve_file(const char *path, int sock,
+    const char *addr_buf, int is_txt);
+
+static int menu_filter(const struct dirent *p_dirent);
+static int menu_sort(const struct dirent **pp_dirent1,
+    const struct dirent **pp_dirent2);
+static const char *serve_menu(const char *path, int sock,
+    const char *addr_buf);
+
+static void handle_conn(int sock, const char *addr_buf);
+
+static int worker_main(int passive_sock);
+
+static volatile sig_atomic_t terminating;
+
+static struct {
+  int should_daemonize;
+
   const char *hostname;
   short port;
   int backlog;
@@ -48,61 +137,30 @@ struct config {
   size_t num_workers;
 
   const char *srv_path;
-};
-
-int main(int argc, char **argv);
-
-static int r_close(int fildes);
-static ssize_t r_read(int fildes, void *buf, size_t nbyte);
-static ssize_t r_write(int fildes, const void *buf, size_t nbytes);
-
-static int worker_printf(pid_t pid, const char *addr_buf, const char *format,
-    ...);
-static int worker_perror(pid_t pid, const char *addr_buf, const char *s);
-
-static struct config *parse_config(int argc, char **argv);
-static void free_config(const struct config *p_config);
-
-static int create_passive_sock(const struct config *p_config);
-static void dispose_passive_sock(int sock);
-
-static int drop_privs(const struct config *p_config);
-
-static pid_t *create_workers(const struct config *p_config, int passive_sock);
-static pid_t start_worker(const struct config *p_config, int passive_sock);
-static void dispose_workers(pid_t *pids);
-
-static const char **parse_request(int sock);
-static void free_request(const char **request);
-
-static int sanitize_path(const struct config *p_config, const char *in_path,
-    char **out_path);
-static char get_item_type(const char *path);
-
-static const char *serve_file(const struct config *p_config, const char *path,
-    int sock, pid_t pid, const char *addr_buf, int is_txt);
-
-static int menu_filter(const struct dirent *p_dirent);
-static int menu_sort(const struct dirent **pp_dirent1,
-    const struct dirent **pp_dirent2);
-static const char *serve_menu(const struct config *p_config,
-    const char *path, int sock, pid_t pid, const char *addr_buf);
-
-static void handle_conn(const struct config *p_config, int sock, pid_t pid,
-    const char *addr_buf);
-
-static int worker_main(const struct config *p_config, int passive_sock,
-    pid_t pid);
-
-static void sigterm_handler(int signum);
-
-static const int one = 1;
-
-static volatile sig_atomic_t terminating;
+} config;
 
 int r_close(int fildes) {
   int ret;
   while ((ret = close(fildes)) == -1 && errno == EINTR);
+  return ret;
+}
+
+int r_open(const char *path, int oflag, ...) {
+  int ret;
+
+  if (oflag & O_CREAT) {
+    va_list varargs;
+    mode_t mode;
+
+    va_start(varargs, oflag);
+    mode = va_arg(varargs, mode_t);
+    va_end(varargs);
+
+    while ((ret = open(path, oflag, mode)) == -1 && errno == EINTR);
+  } else {
+    while ((ret = open(path, oflag)) == -1 && errno == EINTR);
+  }
+
   return ret;
 }
 
@@ -112,121 +170,258 @@ ssize_t r_read(int fildes, void *buf, size_t nbytes) {
   return ret;
 }
 
-ssize_t r_write(int fildes, const void *buf, size_t nbytes) {
+ssize_t r_write(int fildes, const void *buf, size_t nbyte) {
   ssize_t ret;
   do {
-    while ((ret = write(fildes, buf, nbytes)) == -1
+    while ((ret = write(fildes, buf, nbyte)) == -1
         && errno == EINTR);
     buf = (const char *) buf + ret;
-    nbytes -= ret;
-  } while (nbytes && ret != -1);
+    nbyte -= ret;
+  } while (nbyte && ret != -1);
   return ret;
 }
 
-int worker_printf(pid_t pid, const char *addr_buf, const char *format, ...) {
+void log_msg(int pri, const char *addr_buf, const char *format,
+    va_list varargs) {
   char buf[PIPE_BUF], *buf_next = buf;
   int buf_size = sizeof(buf), str_size;
-  va_list varargs;
-
-  if ((str_size = snprintf(buf_next, buf_size, "[%ld] ", (long) pid)) == -1) {
-    return -1;
-  }
-  buf_next += (str_size < buf_size) ? str_size : buf_size;
-  buf_size -= (str_size < buf_size) ? str_size : buf_size;
 
   if (addr_buf) {
     if ((str_size = snprintf(buf_next, buf_size, "%s - ", addr_buf)) == -1) {
-      return -1;
+      return;
     }
     buf_next += (str_size < buf_size) ? str_size : buf_size;
     buf_size -= (str_size < buf_size) ? str_size : buf_size;
   }
 
-  va_start(varargs, format);
   if ((str_size = vsnprintf(buf_next, buf_size, format, varargs)) == -1) {
-    return -1;
+    return;
   }
-  va_end(varargs);
   buf_next += (str_size < buf_size) ? str_size : buf_size;
 
-  *buf_next++ = '\n';
-
-  return r_write(STDERR_FILENO, buf, buf_next - buf);
+  syslog(pri, "%s", buf);
 }
 
-int worker_perror(pid_t pid, const char *addr_buf, const char *s) {
-  return worker_printf(pid, addr_buf, "%s: %s", s, strerror(errno));
+void log_info(const char *addr_buf, const char *format, ...) {
+  va_list varargs;
+
+  va_start(varargs, format);
+  log_msg(LOG_INFO, addr_buf, format, varargs);
+  va_end(varargs);
 }
 
-struct config *parse_config(int argc, char **argv) {
-  struct config *p_config;
+void log_warn(const char *addr_buf, const char *format, ...) {
+  va_list varargs;
 
-  if (!(p_config = malloc(sizeof(*p_config)))) {
-    return NULL;
+  va_start(varargs, format);
+  log_msg(LOG_WARNING, addr_buf, format, varargs);
+  va_end(varargs);
+}
+
+void log_error(const char *addr_buf, const char *format, ...) {
+  va_list varargs;
+
+  va_start(varargs, format);
+  log_msg(LOG_ERR, addr_buf, format, varargs);
+  va_end(varargs);
+}
+
+void log_perror(const char *addr_buf, const char *s) {
+  log_error(addr_buf, "%s: %s", s, strerror(errno));
+}
+
+static void sigterm_handler(int signum) {
+  if (!terminating) {
+    terminating = 1;
+  }
+}
+
+int parse_config(int argc, char **argv) {
+  int opt;
+
+  config.port = DEFAULT_PORT;
+  config.backlog = DEFAULT_BACKLOG;
+  config.num_workers = DEFAULT_WORKERS;
+
+  while ((opt = getopt_long(argc, argv, OPTSTRING, LONGOPTS, NULL)) != -1) {
+    switch (opt) {
+    case OPT_HELP:
+      break;
+
+    case OPT_VERSION:
+      break;
+
+    case OPT_HOST:
+      free((void *) config.hostname);
+      if (!(config.hostname = strdup(optarg))) {
+        free_config();
+        return -1;
+      }
+      break;
+
+    case OPT_PORT:
+      config.port = (short) strtol(optarg, NULL, 10);
+      break;
+
+    case OPT_BACKLOG:
+      config.backlog = (short) strtol(optarg, NULL, 10);
+      break;
+
+    case OPT_USER:
+      free((void *) config.user);
+      if (!(config.user = strdup(optarg))) {
+        free_config();
+        return -1;
+      }
+      break;
+
+    case OPT_DAEMON:
+      config.should_daemonize = 1;
+      break;
+
+    case OPT_WORKERS:
+      config.num_workers = (short) strtol(optarg, NULL, 10);
+      break;
+
+    case OPT_SRV_PATH:
+      free((void *) config.srv_path);
+      if (!(config.srv_path = strdup(optarg))) {
+        free_config();
+        return -1;
+      }
+      break;
+
+    default:
+      fprintf(stderr, USAGE, argv[0]);
+      fprintf(stderr, USAGE_HELP, argv[0]);
+
+      free_config();
+      return -1;
+    }
   }
 
-  p_config->hostname = DEFAULT_HOSTNAME;
-  p_config->port = DEFAULT_PORT;
-  p_config->backlog = DEFAULT_BACKLOG;
-  p_config->user = DEFAULT_USER;
-  p_config->num_workers = DEFAULT_WORKERS;
-
-  if (!(p_config->srv_path = realpath(DEFAULT_SRV_PATH, NULL))) {
-    free(p_config);
-    return NULL;
+  if ((!config.hostname
+          && !(config.hostname = strdup(DEFAULT_HOSTNAME)))
+      || (!config.user && !(config.user = strdup(DEFAULT_USER)))
+      || (!(config.srv_path = realpath(config.srv_path
+          ? config.srv_path : DEFAULT_SRV_PATH, NULL)))) {
+    free_config();
+    return -1;
   }
 
-  return p_config;
+  return 0;
 }
 
-void free_config(const struct config *p_config) {
-  free((void *) p_config->srv_path);
-  free((void *) p_config);
+void free_config() {
+  free((void *) config.hostname);
+  free((void *) config.user);
+  free((void *) config.srv_path);
 }
 
-int drop_privs(const struct config *p_config) {
-  struct passwd *p_passwd;
+/* Based on Section 13.3 on _Advanced Programming in the UNIX Environment_ by
+ * Stevens. */
+int daemonize() {
+  int i, open_max;
 
+  /* Fork once to make sure we're not a process group leader. */
+  switch (fork()) {
+  case -1:
+    return -1;
+
+  case 0:
+    break;
+
+  default:
+    _exit(0);
+  }
+
+  /* Become the leader of a new session and process group, and change to the
+   * root directory. */
+  if (setsid() == -1 || chdir("/")) {
+    return -1;
+  }
+
+  /* Fork again so that we aren't a process group leader anymore, preventing
+   * us from acquiring a controlling terminal. */
+  switch (fork()) {
+  case -1:
+    return -1;
+
+  case 0:
+    break;
+
+  default:
+    _exit(0);
+  }
+
+  /* Set a permissive file mode mask. */
+  umask(0);
+
+  /* Close all (possibly) open files. */
   errno = 0;
+  if ((open_max = (int) sysconf(_SC_OPEN_MAX)) == -1 && errno) {
+    return -1;
+  }
 
-  return (!(p_passwd = getpwnam(p_config->user))
-      || setgid(p_passwd->pw_gid)
-      || setgroups(0, NULL)
-      || setuid(p_passwd->pw_uid)) ? -1 : 0;
+  for (i = 0; i < ((open_max != -1) ? open_max : OPEN_MAX); ++i) {
+    if (r_close(i) == -1 && errno != EBADF) {
+      return -1;
+    }
+  }
+
+  /* Reopen stdin, stdout, and stderr, redirecting them to /dev/null. */
+  if (r_open("/dev/null", O_RDONLY) != STDIN_FILENO
+      || r_open("/dev/null", O_WRONLY) != STDOUT_FILENO
+      || dup(STDOUT_FILENO) != STDERR_FILENO) {
+    return -1;
+  }
+
+  return 0;
 }
 
-int create_passive_sock(const struct config *p_config) {
+int create_passive_sock() {
   int sock;
   struct sockaddr_in addr = { 0 };
 
   addr.sin_family = AF_INET;
-  addr.sin_port = htons(p_config->port);
+  addr.sin_port = htons(config.port);
   addr.sin_addr.s_addr = htonl(INADDR_ANY);
 
   return ((sock = socket(PF_INET, SOCK_STREAM, 0)) != -1 &&
-      !setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one)) &&
+      !setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, &ONE, sizeof(ONE)) &&
       !bind(sock, (struct sockaddr *) &addr, sizeof(addr)) &&
-      !listen(sock, p_config->backlog)) ? sock : -1;
+      !listen(sock, config.backlog)) ? sock : -1;
 }
 
 void dispose_passive_sock(int sock) {
   if (sock != -1) {
     if (r_close(sock)) {
-      perror("Couldn't close passive socket");
+      log_perror(NULL, "Couldn't close passive socket");
     }
   }
 }
 
-pid_t *create_workers(const struct config *p_config, int passive_sock) {
+int drop_privs() {
+  struct passwd *p_passwd;
+
+  errno = 0;
+
+  return (!(p_passwd = getpwnam(config.user))
+      || setgid(p_passwd->pw_gid)
+      || setgroups(0, NULL)
+      || setuid(p_passwd->pw_uid)) ? -1 : 0;
+}
+
+pid_t *create_workers(int passive_sock) {
   size_t i, j;
-  pid_t *pids = malloc(p_config->num_workers * sizeof(pid_t));
+  pid_t *pids = malloc(config.num_workers * sizeof(pid_t));
 
   if (!pids) {
     return NULL;
   }
 
-  for (i = 0; i < p_config->num_workers; ++i) {
-    if ((pids[i] = start_worker(p_config, passive_sock)) == -1) {
+  for (i = 0; i < config.num_workers; ++i) {
+    if ((pids[i] = start_worker(passive_sock)) == -1) {
       for (j = 0; i < i; ++j) {
         kill(pids[j], SIGTERM);
       }
@@ -238,11 +433,11 @@ pid_t *create_workers(const struct config *p_config, int passive_sock) {
   return pids;
 }
 
-pid_t start_worker(const struct config *p_config, int passive_sock) {
+pid_t start_worker(int passive_sock) {
   pid_t pid;
 
   if (!(pid = fork())) {
-    exit(worker_main(p_config, passive_sock, getpid()));
+    exit(worker_main(passive_sock));
   }
 
   return pid;
@@ -332,13 +527,12 @@ void free_request(const char **request) {
   free(request);
 }
 
-int sanitize_path(const struct config *p_config, const char *in_path,
-    char **out_path) {
+int sanitize_path(const char *in_path, char **out_path) {
   if (!(*out_path = realpath(in_path, NULL))) {
     return -1;
   }
 
-  if (strstr(*out_path, p_config->srv_path) != *out_path) {
+  if (strstr(*out_path, config.srv_path) != *out_path) {
     free(*out_path);
     *out_path = NULL;
   }
@@ -384,8 +578,8 @@ cleanup:
   return item_type;
 }
 
-const char *serve_file(const struct config *p_config, const char *path,
-    int sock, pid_t pid, const char *addr_buf, int is_txt) {
+const char *serve_file(const char *path, int sock, const char *addr_buf,
+    int is_txt) {
   const char *err_msg = NULL;
   char buf[RESPONSE_BUF_SIZE];
   ssize_t data_size;
@@ -394,27 +588,27 @@ const char *serve_file(const struct config *p_config, const char *path,
   while ((file = open(path, O_RDONLY)) == -1 && errno == EINTR);
 
   if (file == -1) {
-    worker_perror(pid, addr_buf, "Couldn't open resource");
+    log_perror(addr_buf, "Couldn't open resource");
     err_msg = RESPONSE_ERR_OPEN;
     goto cleanup;
   }
 
   while ((data_size = r_read(file, buf, sizeof(buf)))) {
     if (data_size == -1) {
-      worker_perror(pid, addr_buf, "Couldn't read resource");
+      log_perror(addr_buf, "Couldn't read resource");
       err_msg = RESPONSE_ERR_READ;
       goto cleanup;
     }
 
     if (r_write(sock, buf, data_size) == -1) {
-      worker_perror(pid, addr_buf, "Couldn't send resource to client");
+      log_perror(addr_buf, "Couldn't send resource to client");
       goto cleanup;
     }
   }
 
   if (is_txt) {
     if (r_write(sock, RESPONSE_EOM, sizeof(RESPONSE_EOM)) == -1) {
-      worker_perror(pid, addr_buf, "Couldn't send resource to client");
+      log_perror(addr_buf, "Couldn't send resource to client");
       goto cleanup;
     }
   }
@@ -422,7 +616,7 @@ const char *serve_file(const struct config *p_config, const char *path,
 cleanup:
   if (file != -1) {
     if (r_close(file)) {
-      worker_perror(pid, addr_buf, "Couldn't close resource");
+      log_perror(addr_buf, "Couldn't close resource");
     }
   }
 
@@ -457,8 +651,7 @@ int menu_sort(const struct dirent **pp_dirent1,
   }
 }
 
-const char *serve_menu(const struct config *p_config, const char *path,
-    int sock, pid_t pid, const char *addr_buf) {
+const char *serve_menu(const char *path, int sock, const char *addr_buf) {
   const char *err_msg = NULL;
   char item_type;
   struct dirent **p_dirents = NULL;
@@ -466,7 +659,7 @@ const char *serve_menu(const struct config *p_config, const char *path,
 
   if ((num_dirents = scandir(path, &p_dirents, menu_filter, menu_sort))
       == -1) {
-    worker_perror(pid, addr_buf, "Couldn't scan resource directory");
+    log_perror(addr_buf, "Couldn't scan resource directory");
     err_msg = RESPONSE_ERR_OPEN;
     goto cleanup;
   }
@@ -478,7 +671,7 @@ const char *serve_menu(const struct config *p_config, const char *path,
          direntry_buf[DIRENTRY_BUF_SIZE];
 
     if (!(file_path = malloc(strlen(path) + strlen(file_name) + 2))) {
-      worker_perror(pid, addr_buf, "Couldn't allocate file path");
+      log_perror(addr_buf, "Couldn't allocate file path");
       err_msg = RESPONSE_ERR_READ;
       goto inner_cleanup;
     }
@@ -487,8 +680,8 @@ const char *serve_menu(const struct config *p_config, const char *path,
     strcat(file_path, "/");
     strcat(file_path, file_name);
 
-    if (sanitize_path(p_config, file_path, &sanitized_path)) {
-      worker_perror(pid, addr_buf, "Couldn't sanitize file path");
+    if (sanitize_path(file_path, &sanitized_path)) {
+      log_perror(addr_buf, "Couldn't sanitize file path");
       err_msg = RESPONSE_ERR_READ;
       goto inner_cleanup;
     }
@@ -498,7 +691,7 @@ const char *serve_menu(const struct config *p_config, const char *path,
     }
 
     if (!(item_type = get_item_type(sanitized_path))) {
-      worker_perror(pid, addr_buf, "Couldn't determine item type");
+      log_perror(addr_buf, "Couldn't determine item type");
       err_msg = RESPONSE_ERR_READ;
       goto inner_cleanup;
     }
@@ -509,16 +702,16 @@ const char *serve_menu(const struct config *p_config, const char *path,
             "%c%.70s\t%.255s\t%.255s\t%hd\r\n",
             item_type,
             file_name,
-            sanitized_path + strlen(p_config->srv_path) + 1,
-            p_config->hostname,
-            p_config->port)) == -1) {
-      worker_perror(pid, addr_buf, "Couldn't format menu entry");
+            sanitized_path + strlen(config.srv_path) + 1,
+            config.hostname,
+            config.port)) == -1) {
+      log_perror(addr_buf, "Couldn't format menu entry");
       err_msg = RESPONSE_ERR_READ;
       goto inner_cleanup;
     }
 
     if (r_write(sock, direntry_buf, direntry_size) == -1) {
-      worker_perror(pid, addr_buf, "Couldn't send menu entry to client");
+      log_perror(addr_buf, "Couldn't send menu entry to client");
       err_msg = RESPONSE_ERR_READ;
       goto inner_cleanup;
     }
@@ -530,7 +723,7 @@ const char *serve_menu(const struct config *p_config, const char *path,
   }
 
   if (r_write(sock, RESPONSE_EOM, sizeof(RESPONSE_EOM)) == -1) {
-    worker_perror(pid, addr_buf, "Couldn't send resource to client");
+    log_perror(addr_buf, "Couldn't send resource to client");
     goto cleanup;
   }
 
@@ -540,38 +733,37 @@ cleanup:
   return err_msg;
 }
 
-void handle_conn(const struct config *p_config, int sock, pid_t pid,
-    const char *addr_buf) {
+void handle_conn(int sock, const char *addr_buf) {
   const char **request = NULL, **request_iter, *selector, *err_msg = NULL;
   char *path = NULL, *sanitized_path = NULL, item_type;
 
   if (!(request_iter = request = parse_request(sock))) {
-    worker_perror(pid, addr_buf, "Couldn't read or parse request");
+    log_perror(addr_buf, "Couldn't read or parse request");
     goto cleanup;
   }
 
   if (!(selector = *request_iter++)) {
-    worker_printf(pid, addr_buf, "Request does not contain a selector");
+    log_error(addr_buf, "Request does not contain a selector");
     goto cleanup;
   }
 
-  if (!(path = malloc(strlen(p_config->srv_path) + strlen(selector) + 2))) {
-    worker_perror(pid, addr_buf, "Couldn't allocate resource path");
+  if (!(path = malloc(strlen(config.srv_path) + strlen(selector) + 2))) {
+    log_perror(addr_buf, "Couldn't allocate resource path");
     goto cleanup;
   }
 
-  strcpy(path, p_config->srv_path);
+  strcpy(path, config.srv_path);
   strcat(path, "/");
   strcat(path, selector);
 
-  if (sanitize_path(p_config, path, &sanitized_path)) {
-    worker_perror(pid, addr_buf, "Couldn't sanitize resource path");
+  if (sanitize_path(path, &sanitized_path)) {
+    log_perror(addr_buf, "Couldn't sanitize resource path");
     err_msg = RESPONSE_ERR_OPEN;
     goto cleanup;
   }
 
-  worker_printf(pid, addr_buf, "Accepted request for `%s` (%s)",
-      selector, sanitized_path ? sanitized_path : "forbidden");
+  log_info(addr_buf, "Accepted request for `%s` (%s)", selector,
+      sanitized_path ? sanitized_path : "forbidden");
 
   if (!sanitized_path) {
     err_msg = RESPONSE_ERR_OPEN;
@@ -579,19 +771,18 @@ void handle_conn(const struct config *p_config, int sock, pid_t pid,
   }
 
   if (!(item_type = get_item_type(sanitized_path))) {
-    worker_perror(pid, addr_buf, "Couldn't determine item type");
+    log_perror(addr_buf, "Couldn't determine item type");
     err_msg = RESPONSE_ERR_OPEN;
     goto cleanup;
   }
 
   err_msg = (item_type == ITEM_TYPE_DIR)
-      ? serve_menu(p_config, sanitized_path, sock, pid, addr_buf)
-      : serve_file(p_config, sanitized_path, sock, pid, addr_buf,
+      ? serve_menu(sanitized_path, sock, addr_buf)
+      : serve_file(sanitized_path, sock, addr_buf,
           item_type == ITEM_TYPE_TXT);
 
   if (*request_iter) {
-    worker_printf(pid, addr_buf, "Request contains unexpected element");
-    goto cleanup;
+    log_warn(addr_buf, "Request contains unexpected element");
   }
 
 cleanup:
@@ -605,18 +796,18 @@ cleanup:
   free_request(request);
 }
 
-int worker_main(const struct config *p_config, int passive_sock, pid_t pid) {
+int worker_main(int passive_sock) {
   struct sigaction sig = { 0 };
 
   /* Print a message containing the worker's PID. */
-  worker_printf(pid, NULL, "Spawned worker process", (long)pid);
+  log_info(NULL, "Spawned worker process");
 
   /* Restore the default SIGTERM handler, and ignore SIGPIPE so the worker
    * doesn't die if the client closes the connection prematurely. */
   sig.sa_handler = SIG_IGN;
 
   if (sigaction(SIGPIPE, &sig, NULL)) {
-    worker_perror(pid, NULL, "Couldn't ignore SIGPIPE");
+    log_perror(NULL, "Couldn't ignore SIGPIPE");
     return 1;
   }
 
@@ -634,82 +825,89 @@ int worker_main(const struct config *p_config, int passive_sock, pid_t pid) {
     }
 
     if (conn_sock == -1) {
-      worker_perror(pid, NULL, "Couldn't accept connection request");
+      log_perror(NULL, "Couldn't accept connection request");
       return 1;
     }
 
     /* Format the client's IP address as a string. */
     if (!inet_ntop(AF_INET, &addr.sin_addr, addr_buf, sizeof(addr_buf))) {
-      worker_perror(pid, NULL, "Couldn't format remote IP address");
+      log_perror(NULL, "Couldn't format remote IP address");
       return 1;
     }
 
     /* Handle the new client connection. */
-    handle_conn(p_config, conn_sock, pid, addr_buf);
+    handle_conn(conn_sock, addr_buf);
 
     /* Close the client connection's socket. */
     if (r_close(conn_sock)) {
-      worker_perror(pid, addr_buf, "Couldn't close connection socket");
+      log_perror(addr_buf, "Couldn't close connection socket");
     }
   }
 
   return 0;
 }
 
-static void sigterm_handler(int signum) {
-  if (!terminating) {
-    terminating = 1;
-  }
-}
-
 int main(int argc, char **argv) {
   int exit_status = 0, passive_sock = -1;
   struct sigaction sig = { 0 };
-  const struct config *p_config = NULL;
   pid_t *worker_pids = NULL;
+
+  /* Set up logging. */
+  openlog("seamonster", LOG_PERROR | LOG_PID, LOG_DAEMON);
 
   /* Set up signal handling. */
   sig.sa_handler = sigterm_handler;
 
   if (sigaction(SIGTERM, &sig, NULL)) {
-    perror("Couldn't set SIGTERM handler");
+    fprintf(stderr, "Couldn't set SIGTERM handler\n");
     return 1;
   }
 
-  /* TODO: Parse command line arguments. */
-  if (!(p_config = parse_config(argc, argv))) {
-    perror("Couldn't parse server configuration");
+  /* Parse command line arguments. */
+  errno = 0;
+  if (parse_config(argc, argv)) {
+    if (errno) {
+      fprintf(stderr, "Couldn't parse server configuration\n");
+    }
     exit_status = 1;
     goto cleanup;
+  }
+
+  /* If requested, run as a daemon and set up logging. */
+  if (config.should_daemonize && daemonize()) {
+    if (daemonize()) {
+      fprintf(stderr, "Couldn't run as a daemon");
+      exit_status = 1;
+      goto cleanup;
+    }
   }
 
   /* Create a passive socket to listen for connection requests. */
-  if ((passive_sock = create_passive_sock(p_config)) == -1) {
-    perror("Couldn't open passive socket");
+  if ((passive_sock = create_passive_sock()) == -1) {
+    log_perror(NULL, "Couldn't open passive socket");
     exit_status = 1;
     goto cleanup;
   }
 
-  fprintf(stderr, "Listening on port %hd\n", p_config->port);
+  log_info(NULL, "Listening on port %hd", config.port);
 
   /* Make sure we aren't running as root after we bind the passive socket. */
   if (!getuid()) {
-    if (drop_privs(p_config)) {
-      perror("Couldn't drop root privileges");
+    if (drop_privs()) {
+      log_perror(NULL, "Couldn't drop root privileges");
       exit_status = 1;
       goto cleanup;
     }
 
-    fprintf(stderr, "Dropped root privileges; running as %s\n",
-        p_config->user);
+    log_info(NULL, "Dropped root privileges; running as %s", config.user);
   }
 
   /* Fork off some children to handle clients. */
-  fprintf(stderr, "Starting with %lu workers\n",
-      (unsigned long) p_config->num_workers);
+  log_info(NULL, "Starting with %lu workers",
+      (unsigned long) config.num_workers);
 
-  if (!(worker_pids = create_workers(p_config, passive_sock))) {
-    perror("Couldn't fork workers to handle connections");
+  if (!(worker_pids = create_workers(passive_sock))) {
+    log_perror(NULL, "Couldn't fork workers to handle connections");
     exit_status = 1;
     goto cleanup;
   }
@@ -723,9 +921,9 @@ int main(int argc, char **argv) {
 
     /* On SIGTERM, kill all the workers processes. */
     if (terminating == 1) {
-      fprintf(stderr, "Killing workers on SIGTERM\n");
+      log_info(NULL, "Killing workers on SIGTERM");
 
-      for (i = 0; i < p_config->num_workers; ++i) {
+      for (i = 0; i < config.num_workers; ++i) {
         if (worker_pids[i] != -1) {
           kill(worker_pids[i], SIGTERM);
         }
@@ -745,19 +943,19 @@ int main(int argc, char **argv) {
         continue;
       }
 
-      perror("Couldn't wait for workers to die");
+      log_perror(NULL, "Couldn't wait for workers to die");
       goto cleanup;
     }
 
     /* If we aren't currently terminating, then we should restart workers when
      * they die. */
     if (!terminating && (WIFEXITED(stat_loc) || WIFSIGNALED(stat_loc))) {
-      fprintf(stderr, "Worker %ld died; restarting\n", (long) worker_pid);
+      log_warn(NULL, "Worker %ld died; restarting", (long) worker_pid);
 
-      for (i = 0; i < p_config->num_workers; ++i) {
+      for (i = 0; i < config.num_workers; ++i) {
         if (worker_pids[i] == worker_pid) {
-          if ((worker_pids[i] = start_worker(p_config, passive_sock)) == -1) {
-            perror("Couldn't restart worker");
+          if ((worker_pids[i] = start_worker(passive_sock)) == -1) {
+            log_perror(NULL, "Couldn't restart worker");
           }
 
           break;
@@ -770,7 +968,8 @@ int main(int argc, char **argv) {
 cleanup:
   dispose_workers(worker_pids);
   dispose_passive_sock(passive_sock);
-  free_config(p_config);
+  closelog();
+  free_config();
 
   return exit_status;
 }
