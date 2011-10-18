@@ -19,12 +19,16 @@
 #include <sys/stat.h>
 #include <sys/wait.h>
 
+/* Default configuration options: */
+
 #define DEFAULT_HOSTNAME  "localhost"
 #define DEFAULT_PORT      70
 #define DEFAULT_BACKLOG   256
 #define DEFAULT_USER      "nobody"
 #define DEFAULT_WORKERS   4
 #define DEFAULT_SRV_PATH  "/srv/gopher"
+
+/* Buffer sizes and other magic numbers: */
 
 #ifndef OPEN_MAX
 # define OPEN_MAX         1024
@@ -34,9 +38,15 @@
 #define RESPONSE_BUF_SIZE 4096
 #define DIRENTRY_BUF_SIZE 592
 
+static const int ONE = 1;
+
+/* Gopher protocol strings: */
+
 #define RESPONSE_EOM      ".\r\n"
 #define RESPONSE_ERR_OPEN "3Error opening resource\tinvalid.invalid\t70\r\n"
 #define RESPONSE_ERR_READ "3Error reading resource\tinvalid.invalid\t70\r\n"
+
+/* Gopher item type characters: */
 
 #define ITEM_TYPE_TXT      '0'
 #define ITEM_TYPE_DIR      '1'
@@ -44,8 +54,7 @@
 #define ITEM_TYPE_GIF      'g'
 #define ITEM_TYPE_IMG      'I'
 
-#define USAGE              "Usage: %s [options]\n\n"
-#define USAGE_HELP         "Try %s --help for more information\n"
+/* Command line options: */
 
 #define OPT_HELP           '\0'
 #define OPT_VERSION        '\1'
@@ -72,7 +81,12 @@ static const struct option LONGOPTS[] = {
   { 0 }
 };
 
-static const int ONE = 1;
+/* Usage information and help: */
+
+#define USAGE              "Usage: %s [options]\n\n"
+#define USAGE_HELP         "Try %s --help for more information\n"
+
+/* Forwards declarations: */
 
 int main(int argc, char **argv);
 
@@ -81,12 +95,12 @@ static int r_open(const char *path, int oflag, ...);
 static ssize_t r_read(int fildes, void *buf, size_t nbyte);
 static ssize_t r_write(int fildes, const void *buf, size_t nbyte);
 
-static void log_msg(int pri, const char *addr_buf, const char *format,
+static void log_msg(int pri, const char *addr_str, const char *format,
     va_list varargs);
-static void log_info(const char *addr_buf, const char *format, ...);
-static void log_warn(const char *addr_buf, const char *format, ...);
-static void log_error(const char *addr_buf, const char *format, ...);
-static void log_perror(const char *addr_buf, const char *s);
+static void log_info(const char *addr_str, const char *format, ...);
+static void log_warn(const char *addr_str, const char *format, ...);
+static void log_error(const char *addr_str, const char *format, ...);
+static void log_perror(const char *addr_str, const char *s);
 
 static void sigterm_handler(int signum);
 
@@ -102,26 +116,28 @@ static int drop_privs();
 
 static pid_t *create_workers(int passive_sock);
 static pid_t start_worker(int passive_sock);
-static void dispose_workers(pid_t *pids);
+static void dispose_workers(const pid_t *pids);
 
-static const char **parse_request(int sock);
-static void free_request(const char **request);
+static char **parse_request(int sock);
+static void free_request(const char *const *request);
 
 static int sanitize_path(const char *in_path, char **out_path);
 static char get_item_type(const char *path);
 
 static const char *serve_file(const char *path, int sock,
-    const char *addr_buf, int is_txt);
+    const char *addr_str, int is_txt);
 
 static int menu_filter(const struct dirent *p_dirent);
 static int menu_sort(const struct dirent **pp_dirent1,
     const struct dirent **pp_dirent2);
 static const char *serve_menu(const char *path, int sock,
-    const char *addr_buf);
+    const char *addr_str);
 
-static void handle_conn(int sock, const char *addr_buf);
+static void handle_conn(int sock, const char *addr_str);
 
 static int worker_main(int passive_sock);
+
+/* Global variables: */
 
 static volatile sig_atomic_t terminating;
 
@@ -139,12 +155,23 @@ static struct {
   const char *srv_path;
 } config;
 
+/*
+ * Close the specified file descriptor, retrying when interrupted.
+ *
+ * Returns 0 on success and -1 on error.
+ */
 int r_close(int fildes) {
   int ret;
   while ((ret = close(fildes)) == -1 && errno == EINTR);
   return ret;
 }
 
+/*
+ * Open the file at the specified path with all the usual flag and mode
+ * choices, retrying when interrupted.
+ *
+ * Returns the newly-opened file descriptor on success and -1 on error.
+ */
 int r_open(const char *path, int oflag, ...) {
   int ret;
 
@@ -164,12 +191,24 @@ int r_open(const char *path, int oflag, ...) {
   return ret;
 }
 
+/*
+ * Read at most the specified number of bytes from the given file descriptor,
+ * retrying when interrupted.
+ *
+ * Returns the number of bytes read on success and -1 on error.
+ */
 ssize_t r_read(int fildes, void *buf, size_t nbytes) {
   ssize_t ret;
   while ((ret = read(fildes, buf, nbytes)) == -1 && errno == EINTR);
   return ret;
 }
 
+/*
+ * Write the specified number of bytes to the given file descriptor, retrying
+ * when interrupted.
+ *
+ * Returns the total number of bytes written on success and -1 on error.
+ */
 ssize_t r_write(int fildes, const void *buf, size_t nbyte) {
   ssize_t ret;
   do {
@@ -181,13 +220,17 @@ ssize_t r_write(int fildes, const void *buf, size_t nbyte) {
   return ret;
 }
 
-void log_msg(int pri, const char *addr_buf, const char *format,
+/*
+ * Log a formatted message with the specified priority and optionally the
+ * specified IP address.
+ */
+void log_msg(int pri, const char *addr_str, const char *format,
     va_list varargs) {
   char buf[PIPE_BUF], *buf_next = buf;
   int buf_size = sizeof(buf), str_size;
 
-  if (addr_buf) {
-    if ((str_size = snprintf(buf_next, buf_size, "%s - ", addr_buf)) == -1) {
+  if (addr_str) {
+    if ((str_size = snprintf(buf_next, buf_size, "%s - ", addr_str)) == -1) {
       return;
     }
     buf_next += (str_size < buf_size) ? str_size : buf_size;
@@ -202,40 +245,64 @@ void log_msg(int pri, const char *addr_buf, const char *format,
   syslog(pri, "%s", buf);
 }
 
-void log_info(const char *addr_buf, const char *format, ...) {
+/*
+ * Log a formatted message at INFO priority, optionally including the
+ * specified IP address.
+ */
+void log_info(const char *addr_str, const char *format, ...) {
   va_list varargs;
 
   va_start(varargs, format);
-  log_msg(LOG_INFO, addr_buf, format, varargs);
+  log_msg(LOG_INFO, addr_str, format, varargs);
   va_end(varargs);
 }
 
-void log_warn(const char *addr_buf, const char *format, ...) {
+/*
+ * Log a formatted message at WARNING priority, optionally including the
+ * specified IP address.
+ */
+void log_warn(const char *addr_str, const char *format, ...) {
   va_list varargs;
 
   va_start(varargs, format);
-  log_msg(LOG_WARNING, addr_buf, format, varargs);
+  log_msg(LOG_WARNING, addr_str, format, varargs);
   va_end(varargs);
 }
 
-void log_error(const char *addr_buf, const char *format, ...) {
+/*
+ * Log a formatted message at ERR priority, optionally including the
+ * specified IP address.
+ */
+void log_error(const char *addr_str, const char *format, ...) {
   va_list varargs;
 
   va_start(varargs, format);
-  log_msg(LOG_ERR, addr_buf, format, varargs);
+  log_msg(LOG_ERR, addr_str, format, varargs);
   va_end(varargs);
 }
 
-void log_perror(const char *addr_buf, const char *s) {
-  log_error(addr_buf, "%s: %s", s, strerror(errno));
+/*
+ * Log a message associated with the current value of errno at ERR priority,
+ * optionally including the specified IP address.
+ */
+void log_perror(const char *addr_str, const char *s) {
+  log_error(addr_str, "%s: %s", s, strerror(errno));
 }
 
-static void sigterm_handler(int signum) {
+/*
+ * Respond to SIGTERM by setting a termination flag.
+ */
+void sigterm_handler(int signum) {
   if (!terminating) {
     terminating = 1;
   }
 }
 
+/*
+ * Parse command line arguments into the global config.
+ *
+ * Returns 0 on success and -1 on error.
+ */
 int parse_config(int argc, char **argv) {
   int opt;
 
@@ -252,7 +319,7 @@ int parse_config(int argc, char **argv) {
       break;
 
     case OPT_HOST:
-      free((void *) config.hostname);
+      free((char *) config.hostname);
       if (!(config.hostname = strdup(optarg))) {
         free_config();
         return -1;
@@ -268,7 +335,7 @@ int parse_config(int argc, char **argv) {
       break;
 
     case OPT_USER:
-      free((void *) config.user);
+      free((char *) config.user);
       if (!(config.user = strdup(optarg))) {
         free_config();
         return -1;
@@ -284,7 +351,7 @@ int parse_config(int argc, char **argv) {
       break;
 
     case OPT_SRV_PATH:
-      free((void *) config.srv_path);
+      free((char *) config.srv_path);
       if (!(config.srv_path = strdup(optarg))) {
         free_config();
         return -1;
@@ -312,14 +379,21 @@ int parse_config(int argc, char **argv) {
   return 0;
 }
 
+/*
+ * Free config global members.
+ */
 void free_config() {
   free((void *) config.hostname);
   free((void *) config.user);
   free((void *) config.srv_path);
 }
 
-/* Based on Section 13.3 on _Advanced Programming in the UNIX Environment_ by
- * Stevens. */
+/*
+ * Run as a daemon.
+ *
+ * Based on Section 13.3 in _Advanced Programming in the UNIX Environment_ by
+ * Stevens.
+ */
 int daemonize() {
   int i, open_max;
 
@@ -379,6 +453,9 @@ int daemonize() {
   return 0;
 }
 
+/*
+ * Create a passive socket to listen for incoming connections.
+ */
 int create_passive_sock() {
   int sock;
   struct sockaddr_in addr = { 0 };
@@ -393,6 +470,9 @@ int create_passive_sock() {
       !listen(sock, config.backlog)) ? sock : -1;
 }
 
+/*
+ * Close the specified passive socket.
+ */
 void dispose_passive_sock(int sock) {
   if (sock != -1) {
     if (r_close(sock)) {
@@ -401,6 +481,12 @@ void dispose_passive_sock(int sock) {
   }
 }
 
+/*
+ * Drop root privileges and run as the user specified in the server
+ * configuration.
+ *
+ * Returns 0 on success and -1 on error.
+ */
 int drop_privs() {
   struct passwd *p_passwd;
 
@@ -412,6 +498,12 @@ int drop_privs() {
       || setuid(p_passwd->pw_uid)) ? -1 : 0;
 }
 
+/*
+ * Start the number of worker processes requested in the server
+ * configuration.
+ *
+ * Returns a pointer to an array of PIDs on success and NULL on error.
+ */
 pid_t *create_workers(int passive_sock) {
   size_t i, j;
   pid_t *pids = malloc(config.num_workers * sizeof(pid_t));
@@ -433,6 +525,12 @@ pid_t *create_workers(int passive_sock) {
   return pids;
 }
 
+/*
+ * Fork a new worker process to handle connections to the specified passive
+ * socket.
+ *
+ * Returns the PID of the new worker on success and -1 on error.
+ */
 pid_t start_worker(int passive_sock) {
   pid_t pid;
 
@@ -443,11 +541,20 @@ pid_t start_worker(int passive_sock) {
   return pid;
 }
 
-void dispose_workers(pid_t *pids) {
-  free(pids);
+/*
+ * Free the specified array of worker PIDs.
+ */
+void dispose_workers(const pid_t *pids) {
+  free((pid_t *) pids);
 }
 
-const char **parse_request(int sock) {
+/*
+ * Parse a tab-delimited Gopher request.
+ *
+ * Returns a pointer to an array of strings representing the tab-delimited
+ * request fields on success and NULL on error.
+ */
+char **parse_request(int sock) {
   int done = 0;
   size_t i, num_chunks = 1;
   char *buf_start = NULL, *buf_next = NULL, *buf_end = NULL, **request;
@@ -517,16 +624,28 @@ const char **parse_request(int sock) {
 
   request[num_chunks] = NULL;
 
-  return (const char **) request;
+  return request;
 }
 
-void free_request(const char **request) {
+/*
+ * Free the resources associated with a parsed Gopher request.
+ */
+void free_request(const char *const *request) {
   if (request) {
-    free((void *) *request);
+    free((char *) *request);
   }
-  free(request);
+  free((const char **) request);
 }
 
+/*
+ * Sanitize the given path by converting it to an absolute path which must be
+ * rooted in the path specified in the server configuration.
+ *
+ * Returns 0 on success and -1 on error. If the path referred to by in_path
+ * lies within the srv_path hierarchy, then the out_path will be reassigned to
+ * point to reference the sanitized (absolute) path. If in_path refers to an
+ * invalid location, then out_put will be assigned a NULL pointer.
+ */
 int sanitize_path(const char *in_path, char **out_path) {
   if (!(*out_path = realpath(in_path, NULL))) {
     return -1;
@@ -540,6 +659,13 @@ int sanitize_path(const char *in_path, char **out_path) {
   return 0;
 }
 
+/*
+ * Return the Gopher protocol item type character associated with the
+ * specified path, using the magic library to differentiate text files,
+ * images, and arbitrary binary files.
+ *
+ * Returns a Gopher item type character on success and '\0' on error.
+ */
 char get_item_type(const char *path) {
   char item_type = ITEM_TYPE_BIN;
   const char *mime_type = NULL;
@@ -578,7 +704,13 @@ cleanup:
   return item_type;
 }
 
-const char *serve_file(const char *path, int sock, const char *addr_buf,
+/*
+ * Serve a Gopher protocol file response (text or binary, as specified) to the
+ * given socket.
+ *
+ * Returns NULL on success and a Gopher error response on failure.
+ */
+const char *serve_file(const char *path, int sock, const char *addr_str,
     int is_txt) {
   const char *err_msg = NULL;
   char buf[RESPONSE_BUF_SIZE];
@@ -588,27 +720,27 @@ const char *serve_file(const char *path, int sock, const char *addr_buf,
   while ((file = open(path, O_RDONLY)) == -1 && errno == EINTR);
 
   if (file == -1) {
-    log_perror(addr_buf, "Couldn't open resource");
+    log_perror(addr_str, "Couldn't open resource");
     err_msg = RESPONSE_ERR_OPEN;
     goto cleanup;
   }
 
   while ((data_size = r_read(file, buf, sizeof(buf)))) {
     if (data_size == -1) {
-      log_perror(addr_buf, "Couldn't read resource");
+      log_perror(addr_str, "Couldn't read resource");
       err_msg = RESPONSE_ERR_READ;
       goto cleanup;
     }
 
     if (r_write(sock, buf, data_size) == -1) {
-      log_perror(addr_buf, "Couldn't send resource to client");
+      log_perror(addr_str, "Couldn't send resource to client");
       goto cleanup;
     }
   }
 
   if (is_txt) {
     if (r_write(sock, RESPONSE_EOM, sizeof(RESPONSE_EOM)) == -1) {
-      log_perror(addr_buf, "Couldn't send resource to client");
+      log_perror(addr_str, "Couldn't send resource to client");
       goto cleanup;
     }
   }
@@ -616,13 +748,18 @@ const char *serve_file(const char *path, int sock, const char *addr_buf,
 cleanup:
   if (file != -1) {
     if (r_close(file)) {
-      log_perror(addr_buf, "Couldn't close resource");
+      log_perror(addr_str, "Couldn't close resource");
     }
   }
 
   return err_msg;
 }
 
+/*
+ * scandir filter for generating Gopher menu responses. The current directory
+ * entry (.) will be filtered out, as will directory entries whose names
+ * contain characters that are not valid in Gopher menu responses.
+ */
 int menu_filter(const struct dirent *p_dirent) {
   const char *name = p_dirent->d_name;
   char ch;
@@ -640,6 +777,11 @@ int menu_filter(const struct dirent *p_dirent) {
   return 1;
 }
 
+/*
+ * scandir sort function for generating Gopher menu responses. The parent
+ * directory entry (..) is always sorted first, and the remaining directory
+ * entries are ordered according to strcoll.
+ */
 int menu_sort(const struct dirent **pp_dirent1,
     const struct dirent **pp_dirent2) {
   const char *name1 = (*pp_dirent1)->d_name, *name2 = (*pp_dirent2)->d_name;
@@ -651,7 +793,12 @@ int menu_sort(const struct dirent **pp_dirent1,
   }
 }
 
-const char *serve_menu(const char *path, int sock, const char *addr_buf) {
+/*
+ * Serve a Gopher protocol menu response to the given socket.
+ *
+ * Returns NULL on success and a Gopher error response on failure.
+ */
+const char *serve_menu(const char *path, int sock, const char *addr_str) {
   const char *err_msg = NULL;
   char item_type;
   struct dirent **p_dirents = NULL;
@@ -659,7 +806,7 @@ const char *serve_menu(const char *path, int sock, const char *addr_buf) {
 
   if ((num_dirents = scandir(path, &p_dirents, menu_filter, menu_sort))
       == -1) {
-    log_perror(addr_buf, "Couldn't scan resource directory");
+    log_perror(addr_str, "Couldn't scan resource directory");
     err_msg = RESPONSE_ERR_OPEN;
     goto cleanup;
   }
@@ -671,7 +818,7 @@ const char *serve_menu(const char *path, int sock, const char *addr_buf) {
          direntry_buf[DIRENTRY_BUF_SIZE];
 
     if (!(file_path = malloc(strlen(path) + strlen(file_name) + 2))) {
-      log_perror(addr_buf, "Couldn't allocate file path");
+      log_perror(addr_str, "Couldn't allocate file path");
       err_msg = RESPONSE_ERR_READ;
       goto inner_cleanup;
     }
@@ -681,7 +828,7 @@ const char *serve_menu(const char *path, int sock, const char *addr_buf) {
     strcat(file_path, file_name);
 
     if (sanitize_path(file_path, &sanitized_path)) {
-      log_perror(addr_buf, "Couldn't sanitize file path");
+      log_perror(addr_str, "Couldn't sanitize file path");
       err_msg = RESPONSE_ERR_READ;
       goto inner_cleanup;
     }
@@ -691,7 +838,7 @@ const char *serve_menu(const char *path, int sock, const char *addr_buf) {
     }
 
     if (!(item_type = get_item_type(sanitized_path))) {
-      log_perror(addr_buf, "Couldn't determine item type");
+      log_perror(addr_str, "Couldn't determine item type");
       err_msg = RESPONSE_ERR_READ;
       goto inner_cleanup;
     }
@@ -705,13 +852,13 @@ const char *serve_menu(const char *path, int sock, const char *addr_buf) {
             sanitized_path + strlen(config.srv_path) + 1,
             config.hostname,
             config.port)) == -1) {
-      log_perror(addr_buf, "Couldn't format menu entry");
+      log_perror(addr_str, "Couldn't format menu entry");
       err_msg = RESPONSE_ERR_READ;
       goto inner_cleanup;
     }
 
     if (r_write(sock, direntry_buf, direntry_size) == -1) {
-      log_perror(addr_buf, "Couldn't send menu entry to client");
+      log_perror(addr_str, "Couldn't send menu entry to client");
       err_msg = RESPONSE_ERR_READ;
       goto inner_cleanup;
     }
@@ -723,7 +870,7 @@ const char *serve_menu(const char *path, int sock, const char *addr_buf) {
   }
 
   if (r_write(sock, RESPONSE_EOM, sizeof(RESPONSE_EOM)) == -1) {
-    log_perror(addr_buf, "Couldn't send resource to client");
+    log_perror(addr_str, "Couldn't send resource to client");
     goto cleanup;
   }
 
@@ -733,22 +880,26 @@ cleanup:
   return err_msg;
 }
 
-void handle_conn(int sock, const char *addr_buf) {
-  const char **request = NULL, **request_iter, *selector, *err_msg = NULL;
+/*
+ * Handle an incoming connection with the specified socket and IP address.
+ */
+void handle_conn(int sock, const char *addr_str) {
+  const char *const *request = NULL, *const *request_iter, *selector,
+        *err_msg = NULL;
   char *path = NULL, *sanitized_path = NULL, item_type;
 
-  if (!(request_iter = request = parse_request(sock))) {
-    log_perror(addr_buf, "Couldn't read or parse request");
+  if (!(request_iter = request = (const char *const *) parse_request(sock))) {
+    log_perror(addr_str, "Couldn't read or parse request");
     goto cleanup;
   }
 
   if (!(selector = *request_iter++)) {
-    log_error(addr_buf, "Request does not contain a selector");
+    log_error(addr_str, "Request does not contain a selector");
     goto cleanup;
   }
 
   if (!(path = malloc(strlen(config.srv_path) + strlen(selector) + 2))) {
-    log_perror(addr_buf, "Couldn't allocate resource path");
+    log_perror(addr_str, "Couldn't allocate resource path");
     goto cleanup;
   }
 
@@ -757,12 +908,12 @@ void handle_conn(int sock, const char *addr_buf) {
   strcat(path, selector);
 
   if (sanitize_path(path, &sanitized_path)) {
-    log_perror(addr_buf, "Couldn't sanitize resource path");
+    log_perror(addr_str, "Couldn't sanitize resource path");
     err_msg = RESPONSE_ERR_OPEN;
     goto cleanup;
   }
 
-  log_info(addr_buf, "Accepted request for `%s` (%s)", selector,
+  log_info(addr_str, "Accepted request for `%s` (%s)", selector,
       sanitized_path ? sanitized_path : "forbidden");
 
   if (!sanitized_path) {
@@ -771,18 +922,18 @@ void handle_conn(int sock, const char *addr_buf) {
   }
 
   if (!(item_type = get_item_type(sanitized_path))) {
-    log_perror(addr_buf, "Couldn't determine item type");
+    log_perror(addr_str, "Couldn't determine item type");
     err_msg = RESPONSE_ERR_OPEN;
     goto cleanup;
   }
 
   err_msg = (item_type == ITEM_TYPE_DIR)
-      ? serve_menu(sanitized_path, sock, addr_buf)
-      : serve_file(sanitized_path, sock, addr_buf,
+      ? serve_menu(sanitized_path, sock, addr_str)
+      : serve_file(sanitized_path, sock, addr_str,
           item_type == ITEM_TYPE_TXT);
 
   if (*request_iter) {
-    log_warn(addr_buf, "Request contains unexpected element");
+    log_warn(addr_str, "Request contains unexpected element");
   }
 
 cleanup:
@@ -796,6 +947,9 @@ cleanup:
   free_request(request);
 }
 
+/*
+ * Main worker process code.
+ */
 int worker_main(int passive_sock) {
   struct sigaction sig = { 0 };
 
@@ -815,12 +969,12 @@ int worker_main(int passive_sock) {
   while (!terminating) {
     int conn_sock;
     struct sockaddr_in addr;
-    socklen_t addr_size = sizeof(addr);
-    char addr_buf[INET_ADDRSTRLEN];
+    socklen_t addr_buf = sizeof(addr);
+    char addr_str[INET_ADDRSTRLEN];
 
     /* Accept an incoming connection request. */
     if ((conn_sock = accept(passive_sock, (struct sockaddr *)&addr,
-        &addr_size)) == -1 && errno == EINTR) {
+        &addr_buf)) == -1 && errno == EINTR) {
       continue;
     }
 
@@ -830,23 +984,26 @@ int worker_main(int passive_sock) {
     }
 
     /* Format the client's IP address as a string. */
-    if (!inet_ntop(AF_INET, &addr.sin_addr, addr_buf, sizeof(addr_buf))) {
+    if (!inet_ntop(AF_INET, &addr.sin_addr, addr_str, sizeof(addr_str))) {
       log_perror(NULL, "Couldn't format remote IP address");
       return 1;
     }
 
     /* Handle the new client connection. */
-    handle_conn(conn_sock, addr_buf);
+    handle_conn(conn_sock, addr_str);
 
     /* Close the client connection's socket. */
     if (r_close(conn_sock)) {
-      log_perror(addr_buf, "Couldn't close connection socket");
+      log_perror(addr_str, "Couldn't close connection socket");
     }
   }
 
   return 0;
 }
 
+/*
+ * Main server process code.
+ */
 int main(int argc, char **argv) {
   int exit_status = 0, passive_sock = -1;
   struct sigaction sig = { 0 };
