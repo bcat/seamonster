@@ -52,6 +52,7 @@ static const int ONE = 1;
 #define ITEM_TYPE_DIR      '1'
 #define ITEM_TYPE_BIN      '9'
 #define ITEM_TYPE_GIF      'g'
+#define ITEM_TYPE_HTM      'h'
 #define ITEM_TYPE_IMG      'I'
 
 /* Command line options: */
@@ -689,7 +690,9 @@ char get_item_type(const char *path) {
   }
 
   if (strstr(mime_type, "text/") == mime_type) {
-    item_type = ITEM_TYPE_TXT;
+    item_type = !strcmp(mime_type + sizeof("text/") - 1, "html")
+        ? ITEM_TYPE_HTM
+        : ITEM_TYPE_TXT;
   } else if (strstr(mime_type, "image/") == mime_type) {
     item_type = !strcmp(mime_type + sizeof("image/") - 1, "gif")
         ? ITEM_TYPE_GIF
