@@ -21,6 +21,8 @@
 
 /* Default configuration options: */
 
+#define DEFAULT_DAEMONIZE 0
+#define DEFAULT_PID_FILE  "/var/run/seamonster.pid"
 #define DEFAULT_HOSTNAME  "localhost"
 #define DEFAULT_PORT      70
 #define DEFAULT_BACKLOG   256
@@ -59,7 +61,8 @@ static const int ONE = 1;
 
 #define OPT_HELP           '\0'
 #define OPT_VERSION        '\1'
-#define OPT_DAEMON         'd'
+#define OPT_DAEMONIZE      'd'
+#define OPT_PID_FILE       'P'
 #define OPT_HOST           'h'
 #define OPT_PORT           'p'
 #define OPT_BACKLOG        'b'
@@ -67,22 +70,36 @@ static const int ONE = 1;
 #define OPT_WORKERS        'w'
 #define OPT_SRV_PATH       's'
 
-#define OPTSTRING          "dh:p:b:u:w:s:"
+#define OPTSTRING          "dP:h:p:b:u:w:s:"
 
 static const struct option LONGOPTS[] = {
-  { "help",     0, NULL, OPT_HELP },
-  { "version",  0, NULL, OPT_VERSION },
-  { "daemon",   0, NULL, OPT_DAEMON },
-  { "host",     1, NULL, OPT_HOST },
-  { "port",     1, NULL, OPT_PORT },
-  { "backlog",  1, NULL, OPT_BACKLOG },
-  { "user",     1, NULL, OPT_USER },
-  { "workers",  1, NULL, OPT_WORKERS },
-  { "srv-path", 1, NULL, OPT_SRV_PATH },
+  { "help",      0, NULL, OPT_HELP },
+  { "version",   0, NULL, OPT_VERSION },
+  { "daemonize", 0, NULL, OPT_DAEMONIZE },
+  { "pid-file",  1, NULL, OPT_PID_FILE },
+  { "host",      1, NULL, OPT_HOST },
+  { "port",      1, NULL, OPT_PORT },
+  { "backlog",   1, NULL, OPT_BACKLOG },
+  { "user",      1, NULL, OPT_USER },
+  { "workers",   1, NULL, OPT_WORKERS },
+  { "srv-path",  1, NULL, OPT_SRV_PATH },
   { 0 }
 };
 
-/* Usage information and help: */
+/* Documentation: */
+
+#define VERSION            "seamonster 0.1 / A tiny hack of a Gopher " \
+                               "server\n" \
+                           "Copyright (C) 2011 Jonathan Rascher\n\n" \
+                           "    May your love reach to the sky\n" \
+                           "    May your sun be always bright\n" \
+                           "    May hope guide you\n" \
+                           "    Your best dreams come true\n" \
+                           "    When we reach out to the sun\n" \
+                           "    When you and I are one\n" \
+                           "    My heart is true\n" \
+                           "    Let love cover you\n" \
+                           "--- \"Seamonster\" by the violet burning\n"
 
 #define USAGE              "Usage: %s [options]\n\n"
 #define USAGE_HELP         "Try %s --help for more information\n"
@@ -143,7 +160,8 @@ static int worker_main(int passive_sock);
 static volatile sig_atomic_t terminating;
 
 static struct {
-  int should_daemonize;
+  int daemonize;
+  const char *pid_file;
 
   const char *hostname;
   short port;
@@ -302,11 +320,13 @@ void sigterm_handler(int signum) {
 /*
  * Parse command line arguments into the global config.
  *
- * Returns 0 on success and -1 on error.
+ * Returns 0 on success and -1 on error. If an invalid option is provided,
+ * then errno will be set to EINVAL.
  */
 int parse_config(int argc, char **argv) {
   int opt;
 
+  config.daemonize = DEFAULT_DAEMONIZE;
   config.port = DEFAULT_PORT;
   config.backlog = DEFAULT_BACKLOG;
   config.num_workers = DEFAULT_WORKERS;
@@ -317,7 +337,9 @@ int parse_config(int argc, char **argv) {
       break;
 
     case OPT_VERSION:
-      break;
+      fprintf(stderr, "%s", VERSION);
+      free_config();
+      return -1;
 
     case OPT_HOST:
       free((char *) config.hostname);
@@ -343,8 +365,16 @@ int parse_config(int argc, char **argv) {
       }
       break;
 
-    case OPT_DAEMON:
-      config.should_daemonize = 1;
+    case OPT_DAEMONIZE:
+      config.daemonize = 1;
+      break;
+
+    case OPT_PID_FILE:
+      free((char *) config.pid_file);
+      if (!(config.pid_file = strdup(optarg))) {
+        free_config();
+        return -1;
+      }
       break;
 
     case OPT_WORKERS:
@@ -362,14 +392,14 @@ int parse_config(int argc, char **argv) {
     default:
       fprintf(stderr, USAGE, argv[0]);
       fprintf(stderr, USAGE_HELP, argv[0]);
-
       free_config();
+      errno = EINVAL;
       return -1;
     }
   }
 
-  if ((!config.hostname
-          && !(config.hostname = strdup(DEFAULT_HOSTNAME)))
+  if ((!config.pid_file && !(config.pid_file = strdup(DEFAULT_PID_FILE)))
+      || (!config.hostname && !(config.hostname = strdup(DEFAULT_HOSTNAME)))
       || (!config.user && !(config.user = strdup(DEFAULT_USER)))
       || (!(config.srv_path = realpath(config.srv_path
           ? config.srv_path : DEFAULT_SRV_PATH, NULL)))) {
@@ -384,6 +414,7 @@ int parse_config(int argc, char **argv) {
  * Free config global members.
  */
 void free_config() {
+  free((void *) config.pid_file);
   free((void *) config.hostname);
   free((void *) config.user);
   free((void *) config.srv_path);
@@ -1019,7 +1050,7 @@ int main(int argc, char **argv) {
   sig.sa_handler = sigterm_handler;
 
   if (sigaction(SIGTERM, &sig, NULL)) {
-    fprintf(stderr, "Couldn't set SIGTERM handler\n");
+    perror("Couldn't set SIGTERM handler\n");
     return 1;
   }
 
@@ -1027,16 +1058,18 @@ int main(int argc, char **argv) {
   errno = 0;
   if (parse_config(argc, argv)) {
     if (errno) {
-      fprintf(stderr, "Couldn't parse server configuration\n");
+      if (errno != EINVAL) {
+        perror("Couldn't parse server configuration\n");
+      }
+      exit_status = 1;
     }
-    exit_status = 1;
     goto cleanup;
   }
 
   /* If requested, run as a daemon and set up logging. */
-  if (config.should_daemonize && daemonize()) {
+  if (config.daemonize && daemonize()) {
     if (daemonize()) {
-      fprintf(stderr, "Couldn't run as a daemon");
+      perror("Couldn't run as a daemon");
       exit_status = 1;
       goto cleanup;
     }
