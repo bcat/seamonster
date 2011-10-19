@@ -852,7 +852,7 @@ const char *serve_menu(const char *path, int sock, const char *addr_str) {
             "%c%.70s\t%.255s\t%.255s\t%hd\r\n",
             item_type,
             file_name,
-            sanitized_path + strlen(config.srv_path) + 1,
+            sanitized_path + strlen(config.srv_path),
             config.hostname,
             config.port)) == -1) {
       log_perror(addr_str, "Couldn't format menu entry");
