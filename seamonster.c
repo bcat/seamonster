@@ -999,6 +999,16 @@ int worker_main(int passive_sock) {
     return 1;
   }
 
+  /* Make sure worker processes don't run as root. */
+  if (!getuid()) {
+    if (drop_privs()) {
+      log_perror(NULL, "Couldn't drop root privileges");
+      return 1;
+    }
+
+    log_info(NULL, "Dropped root privileges; running as %s", config.user);
+  }
+
   /* Process connections until we're asked to terminate cleanly. */
   while (!terminating) {
     int conn_sock;
@@ -1083,17 +1093,6 @@ int main(int argc, char **argv) {
   }
 
   log_info(NULL, "Listening on port %hd", config.port);
-
-  /* Make sure we aren't running as root after we bind the passive socket. */
-  if (!getuid()) {
-    if (drop_privs()) {
-      log_perror(NULL, "Couldn't drop root privileges");
-      exit_status = 1;
-      goto cleanup;
-    }
-
-    log_info(NULL, "Dropped root privileges; running as %s", config.user);
-  }
 
   /* Fork off some children to handle clients. */
   log_info(NULL, "Starting with %lu workers",
