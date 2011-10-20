@@ -36,6 +36,9 @@
 # define OPEN_MAX         1024
 #endif
 
+#define PID_FILE_MODE     (S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH)
+
+#define PID_BUF_SIZE      22
 #define REQUEST_BUF_SIZE  256
 #define RESPONSE_BUF_SIZE 4096
 #define DIRENTRY_BUF_SIZE 592
@@ -121,6 +124,7 @@ static void log_error(const char *addr_str, const char *format, ...);
 static void log_perror(const char *addr_str, const char *s);
 
 static void sigterm_handler(int signum);
+static void delete_pid_file(void);
 
 static int parse_config(int argc, char **argv);
 static void free_config();
@@ -158,6 +162,8 @@ static int worker_main(int passive_sock);
 /* Global variables: */
 
 static volatile sig_atomic_t terminating;
+
+static pid_t server_pid;
 
 static struct {
   int daemonize;
@@ -318,6 +324,15 @@ void sigterm_handler(int signum) {
 }
 
 /*
+ * Delete PID file (if running as a daemon) when the server exits normally.
+ */
+void delete_pid_file(void) {
+  if (getpid() == server_pid && config.daemonize) {
+    unlink(config.pid_file);
+  }
+}
+
+/*
  * Parse command line arguments into the global config.
  *
  * Returns 0 on success and -1 on error. If an invalid option is provided,
@@ -414,7 +429,6 @@ int parse_config(int argc, char **argv) {
  * Free config global members.
  */
 void free_config() {
-  free((void *) config.pid_file);
   free((void *) config.hostname);
   free((void *) config.user);
   free((void *) config.srv_path);
@@ -427,7 +441,8 @@ void free_config() {
  * Stevens.
  */
 int daemonize() {
-  int i, open_max;
+  char pid_buf[PID_BUF_SIZE];
+  int ret = 0, i, open_max, pid_fd = -1, pid_data_size;
 
   /* Fork once to make sure we're not a process group leader. */
   switch (fork()) {
@@ -444,14 +459,16 @@ int daemonize() {
   /* Become the leader of a new session and process group, and change to the
    * root directory. */
   if (setsid() == -1 || chdir("/")) {
-    return -1;
+    ret = -1;
+    goto cleanup;
   }
 
   /* Fork again so that we aren't a process group leader anymore, preventing
    * us from acquiring a controlling terminal. */
   switch (fork()) {
   case -1:
-    return -1;
+    ret = -1;
+    goto cleanup;
 
   case 0:
     break;
@@ -460,18 +477,23 @@ int daemonize() {
     _exit(0);
   }
 
+  /* Record our new server PID. */
+  server_pid = getpid();
+
   /* Set a permissive file mode mask. */
   umask(0);
 
   /* Close all (possibly) open files. */
   errno = 0;
   if ((open_max = (int) sysconf(_SC_OPEN_MAX)) == -1 && errno) {
-    return -1;
+    ret = -1;
+    goto cleanup;
   }
 
   for (i = 0; i < ((open_max != -1) ? open_max : OPEN_MAX); ++i) {
     if (r_close(i) == -1 && errno != EBADF) {
-      return -1;
+      ret = -1;
+      goto cleanup;
     }
   }
 
@@ -479,10 +501,38 @@ int daemonize() {
   if (r_open("/dev/null", O_RDONLY) != STDIN_FILENO
       || r_open("/dev/null", O_WRONLY) != STDOUT_FILENO
       || dup(STDOUT_FILENO) != STDERR_FILENO) {
-    return -1;
+    ret = -1;
+    goto cleanup;
   }
 
-  return 0;
+  /* Create a PID file, and prepare to delete it on exit. */
+  if ((pid_fd = r_open(config.pid_file, O_WRONLY | O_CREAT | O_EXCL,
+          PID_FILE_MODE)) == -1) {
+    ret = -1;
+    goto cleanup;
+  }
+
+  pid_data_size = snprintf(pid_buf, sizeof(pid_buf), "%ld\n",
+      (long) server_pid);
+
+  if (pid_data_size < 0 || pid_data_size >= sizeof(pid_buf)) {
+    ret = -1;
+    goto cleanup;
+  }
+
+  if (r_write(pid_fd, pid_buf, pid_data_size) == -1) {
+    ret = -1;
+    goto cleanup;
+  }
+
+  atexit(delete_pid_file);
+
+cleanup:
+  r_close(pid_fd);
+  if (ret == -1 && pid_fd != -1) {
+    unlink(config.pid_file);
+  }
+  return ret;
 }
 
 /*
@@ -1052,6 +1102,9 @@ int main(int argc, char **argv) {
   int exit_status = 0, passive_sock = -1;
   struct sigaction sig = { 0 };
   pid_t *worker_pids = NULL;
+
+  /* Record out PID for future reference. */
+  server_pid = getpid();
 
   /* Set up logging. */
   openlog("seamonster", LOG_PERROR | LOG_PID, LOG_DAEMON);
