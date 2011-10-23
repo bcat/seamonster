@@ -127,18 +127,15 @@ static void sigterm_handler(int signum);
 static void delete_pid_file(void);
 
 static int parse_config(int argc, char **argv);
-static void free_config();
 
 static int daemonize();
 
 static int create_passive_sock();
-static void dispose_passive_sock(int sock);
 
 static int drop_privs();
 
 static pid_t *create_workers(int passive_sock);
 static pid_t start_worker(int passive_sock);
-static void dispose_workers(const pid_t *pids);
 
 static char **parse_request(int sock);
 static void free_request(const char *const *request);
@@ -353,13 +350,11 @@ int parse_config(int argc, char **argv) {
 
     case OPT_VERSION:
       fprintf(stderr, "%s", VERSION);
-      free_config();
       return -1;
 
     case OPT_HOST:
       free((char *) config.hostname);
       if (!(config.hostname = strdup(optarg))) {
-        free_config();
         return -1;
       }
       break;
@@ -375,7 +370,6 @@ int parse_config(int argc, char **argv) {
     case OPT_USER:
       free((char *) config.user);
       if (!(config.user = strdup(optarg))) {
-        free_config();
         return -1;
       }
       break;
@@ -387,7 +381,6 @@ int parse_config(int argc, char **argv) {
     case OPT_PID_FILE:
       free((char *) config.pid_file);
       if (!(config.pid_file = strdup(optarg))) {
-        free_config();
         return -1;
       }
       break;
@@ -399,7 +392,6 @@ int parse_config(int argc, char **argv) {
     case OPT_SRV_PATH:
       free((char *) config.srv_path);
       if (!(config.srv_path = strdup(optarg))) {
-        free_config();
         return -1;
       }
       break;
@@ -407,7 +399,6 @@ int parse_config(int argc, char **argv) {
     default:
       fprintf(stderr, USAGE, argv[0]);
       fprintf(stderr, USAGE_HELP, argv[0]);
-      free_config();
       errno = EINVAL;
       return -1;
     }
@@ -418,20 +409,10 @@ int parse_config(int argc, char **argv) {
       || (!config.user && !(config.user = strdup(DEFAULT_USER)))
       || (!(config.srv_path = realpath(config.srv_path
           ? config.srv_path : DEFAULT_SRV_PATH, NULL)))) {
-    free_config();
     return -1;
   }
 
   return 0;
-}
-
-/*
- * Free config global members.
- */
-void free_config() {
-  free((void *) config.hostname);
-  free((void *) config.user);
-  free((void *) config.srv_path);
 }
 
 /*
@@ -553,17 +534,6 @@ int create_passive_sock() {
 }
 
 /*
- * Close the specified passive socket.
- */
-void dispose_passive_sock(int sock) {
-  if (sock != -1) {
-    if (r_close(sock)) {
-      log_perror(NULL, "Couldn't close passive socket");
-    }
-  }
-}
-
-/*
  * Drop root privileges and run as the user specified in the server
  * configuration.
  *
@@ -621,13 +591,6 @@ pid_t start_worker(int passive_sock) {
   }
 
   return pid;
-}
-
-/*
- * Free the specified array of worker PIDs.
- */
-void dispose_workers(const pid_t *pids) {
-  free((pid_t *) pids);
 }
 
 /*
@@ -1099,7 +1062,7 @@ int worker_main(int passive_sock) {
  * Main server process code.
  */
 int main(int argc, char **argv) {
-  int exit_status = 0, passive_sock = -1;
+  int passive_sock = -1;
   struct sigaction sig = { 0 };
   pid_t *worker_pids = NULL;
 
@@ -1124,25 +1087,23 @@ int main(int argc, char **argv) {
       if (errno != EINVAL) {
         perror("Couldn't parse server configuration\n");
       }
-      exit_status = 1;
+      return 1;
     }
-    goto cleanup;
+    return 0;
   }
 
   /* If requested, run as a daemon and set up logging. */
   if (config.daemonize && daemonize()) {
     if (daemonize()) {
       perror("Couldn't run as a daemon");
-      exit_status = 1;
-      goto cleanup;
+      return 1;
     }
   }
 
   /* Create a passive socket to listen for connection requests. */
   if ((passive_sock = create_passive_sock()) == -1) {
     log_perror(NULL, "Couldn't open passive socket");
-    exit_status = 1;
-    goto cleanup;
+    return 1;
   }
 
   log_info(NULL, "Listening on port %hd", config.port);
@@ -1153,8 +1114,7 @@ int main(int argc, char **argv) {
 
   if (!(worker_pids = create_workers(passive_sock))) {
     log_perror(NULL, "Couldn't fork workers to handle connections");
-    exit_status = 1;
-    goto cleanup;
+    return 1;
   }
 
   /* Kill all workers on when the parent terminates cleanly, and restart any
@@ -1189,7 +1149,7 @@ int main(int argc, char **argv) {
       }
 
       log_perror(NULL, "Couldn't wait for workers to die");
-      goto cleanup;
+      return 1;
     }
 
     /* If we aren't currently terminating, then we should restart workers when
@@ -1209,12 +1169,5 @@ int main(int argc, char **argv) {
     }
   }
 
-  /* Clean up after ourselves. */
-cleanup:
-  dispose_workers(worker_pids);
-  dispose_passive_sock(passive_sock);
-  closelog();
-  free_config();
-
-  return exit_status;
+  return 0;
 }
