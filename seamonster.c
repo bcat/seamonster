@@ -1003,8 +1003,8 @@ int worker_main(int passive_sock) {
   /* Print a message containing the worker's PID. */
   log_info(NULL, "Spawned worker process");
 
-  /* Restore the default SIGTERM handler, and ignore SIGPIPE so the worker
-   * doesn't die if the client closes the connection prematurely. */
+  /* Ignore SIGPIPE so the worker doesn't die if the client closes the
+   * connection prematurely. */
   sig.sa_handler = SIG_IGN;
 
   if (sigaction(SIGPIPE, &sig, NULL)) {
