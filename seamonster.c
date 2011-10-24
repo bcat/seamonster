@@ -53,27 +53,27 @@ static const int ONE = 1;
 
 /* Gopher item type characters: */
 
-#define ITEM_TYPE_TXT      '0'
-#define ITEM_TYPE_DIR      '1'
-#define ITEM_TYPE_BIN      '9'
-#define ITEM_TYPE_GIF      'g'
-#define ITEM_TYPE_HTM      'h'
-#define ITEM_TYPE_IMG      'I'
+#define ITEM_TYPE_TXT     '0'
+#define ITEM_TYPE_DIR     '1'
+#define ITEM_TYPE_BIN     '9'
+#define ITEM_TYPE_GIF     'g'
+#define ITEM_TYPE_HTM     'h'
+#define ITEM_TYPE_IMG     'I'
 
 /* Command line options: */
 
-#define OPT_HELP           '\0'
-#define OPT_VERSION        '\1'
-#define OPT_DAEMONIZE      'd'
-#define OPT_PID_FILE       'P'
-#define OPT_HOST           'h'
-#define OPT_PORT           'p'
-#define OPT_BACKLOG        'b'
-#define OPT_USER           'u'
-#define OPT_WORKERS        'w'
-#define OPT_SRV_PATH       's'
+#define OPT_HELP          '\0'
+#define OPT_VERSION       '\1'
+#define OPT_DAEMONIZE     'd'
+#define OPT_PID_FILE      'P'
+#define OPT_HOST          'h'
+#define OPT_PORT          'p'
+#define OPT_BACKLOG       'b'
+#define OPT_USER          'u'
+#define OPT_WORKERS       'w'
+#define OPT_SRV_PATH      's'
 
-#define OPTSTRING          "dP:h:p:b:u:w:s:"
+#define OPTSTRING         "dP:h:p:b:u:w:s:"
 
 static const struct option LONGOPTS[] = {
   { "help",      0, NULL, OPT_HELP },
@@ -91,21 +91,21 @@ static const struct option LONGOPTS[] = {
 
 /* Documentation: */
 
-#define VERSION            "seamonster 0.1 / A tiny hack of a Gopher " \
-                               "server\n" \
-                           "Copyright (C) 2011 Jonathan Rascher\n\n" \
-                           "    May your love reach to the sky\n" \
-                           "    May your sun be always bright\n" \
-                           "    May hope guide you\n" \
-                           "    Your best dreams come true\n" \
-                           "    When we reach out to the sun\n" \
-                           "    When you and I are one\n" \
-                           "    My heart is true\n" \
-                           "    Let love cover you\n" \
-                           "--- \"Seamonster\" by the violet burning\n"
+#define VERSION           "seamonster 0.1 / A tiny hack of a Gopher " \
+                              "server\n" \
+                          "Copyright (C) 2011 Jonathan Rascher\n\n" \
+                          "    May your love reach to the sky\n" \
+                          "    May your sun be always bright\n" \
+                          "    May hope guide you\n" \
+                          "    Your best dreams come true\n" \
+                          "    When we reach out to the sun\n" \
+                          "    When you and I are one\n" \
+                          "    My heart is true\n" \
+                          "    Let love cover you\n" \
+                          "--- \"Seamonster\" by the violet burning\n"
 
-#define USAGE              "Usage: %s [options]\n\n"
-#define USAGE_HELP         "Try %s --help for more information\n"
+#define USAGE             "Usage: %s [options]\n\n"
+#define USAGE_HELP        "Try %s --help for more information\n"
 
 /* Forwards declarations: */
 
