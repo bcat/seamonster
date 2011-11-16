@@ -36,6 +36,10 @@
 # define OPEN_MAX         1024
 #endif
 
+#ifndef PIPE_BUF
+# define PIPE_BUF         _POSIX_PIPE_BUF
+#endif
+
 #define PID_FILE_MODE     (S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH)
 
 #define PID_BUF_SIZE      22
