@@ -121,6 +121,8 @@ static int r_close(int fildes);
 static int r_open(const char *path, int oflag, ...);
 static ssize_t r_read(int fildes, void *buf, size_t nbyte);
 static ssize_t r_write(int fildes, const void *buf, size_t nbyte);
+static int r_accept(int socket, struct sockaddr *address,
+    socklen_t *address_len);
 
 static int asprintf(char **p_s, const char *format, ...);
 static int vasprintf(char **p_s, const char *format, va_list va);
@@ -248,6 +250,13 @@ ssize_t r_write(int fildes, const void *buf, size_t nbyte) {
     buf = (const char *) buf + ret;
     nbyte -= ret;
   } while (nbyte && ret != -1);
+  return ret;
+}
+
+int r_accept(int socket, struct sockaddr *address, socklen_t *address_len) {
+  int ret;
+  while ((ret = accept(socket, address, address_len)) == -1
+      && errno == EINTR);
   return ret;
 }
 
@@ -1185,7 +1194,7 @@ int worker_main(int passive_sock) {
     char addr_str[INET_ADDRSTRLEN];
 
     /* Accept an incoming connection request. */
-    if ((conn_sock = accept(passive_sock, (struct sockaddr *)&addr,
+    if ((conn_sock = r_accept(passive_sock, (struct sockaddr *)&addr,
         &addr_buf)) == -1 && errno == EINTR) {
       continue;
     }
