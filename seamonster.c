@@ -1194,11 +1194,7 @@ int worker_main(int passive_sock) {
 
     /* Accept an incoming connection request. */
     if ((conn_sock = r_accept(passive_sock, (struct sockaddr *)&addr,
-        &addr_buf)) == -1 && errno == EINTR) {
-      continue;
-    }
-
-    if (conn_sock == -1) {
+            &addr_buf)) == -1) {
       log_perror(NULL, "Couldn't accept connection request");
       return 1;
     }
