@@ -287,22 +287,32 @@ int asprintf(char **p_s, const char *format, ...) {
  */
 int vasprintf(char **p_s, const char *format, va_list va) {
   int ret;
-  char *s;
+  char *s = NULL;
+  va_list va2;
+
+  va_copy(va2, va);
 
   if ((ret = vsnprintf(NULL, 0, format, va)) < 0) {
-    return ret;
+    goto cleanup;
   }
 
   if (!(s = malloc(ret + 1))) {
-    return -1;
+    ret = -1;
+    goto cleanup;
   }
 
-  if ((ret = vsnprintf(s, ret + 1, format, va)) < 0) {
-    free(s);
-    return ret;
+  if ((ret = vsnprintf(s, ret + 1, format, va2)) < 0) {
+    goto cleanup;
   }
 
   *p_s = s;
+
+cleanup:
+  if (ret < 0) {
+    free(s);
+  }
+  va_end(va2);
+
   return ret;
 }
 
@@ -1109,14 +1119,10 @@ void handle_conn(int sock, const char *addr_str) {
     goto cleanup;
   }
 
-  if (!(path = malloc(strlen(config.srv_path) + strlen(selector) + 2))) {
+  if (asprintf(&path, "%s/%s", config.srv_path, selector) < 0) {
     log_perror(addr_str, "Couldn't allocate resource path");
     goto cleanup;
   }
-
-  strcpy(path, config.srv_path);
-  strcat(path, "/");
-  strcat(path, selector);
 
   if (sanitize_path(path, &sanitized_path)) {
     log_perror(addr_str, "Couldn't sanitize resource path");
