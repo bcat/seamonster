@@ -1096,7 +1096,7 @@ cleanup:
  */
 void handle_conn(int sock, const char *addr_str) {
   const char *const *request = NULL, *const *request_iter, *selector,
-        *err_msg = NULL;
+      *err_msg = NULL;
   char *path = NULL, *sanitized_path = NULL, item_type;
 
   if (!(request_iter = request = (const char *const *) parse_request(sock))) {
