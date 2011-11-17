@@ -54,8 +54,7 @@ static const int ONE = 1;
 /* Gopher protocol strings: */
 
 #define RESPONSE_EOM      ".\r\n"
-#define RESPONSE_ERR_OPEN "3Error opening resource\tinvalid.invalid\t70\r\n"
-#define RESPONSE_ERR_READ "3Error reading resource\tinvalid.invalid\t70\r\n"
+#define RESPONSE_ERR      "3Error reading resource\tinvalid.invalid\t70\r\n"
 
 /* Gopher item type characters: */
 
@@ -937,14 +936,14 @@ const char *serve_file(const char *path, int sock, const char *addr_str,
 
   if (file == -1) {
     log_perror(addr_str, "Couldn't open resource");
-    err_msg = RESPONSE_ERR_OPEN;
+    err_msg = RESPONSE_ERR;
     goto cleanup;
   }
 
   while ((data_size = r_read(file, buf, sizeof(buf)))) {
     if (data_size == -1) {
       log_perror(addr_str, "Couldn't read resource");
-      err_msg = RESPONSE_ERR_READ;
+      err_msg = RESPONSE_ERR;
       goto cleanup;
     }
 
@@ -1019,7 +1018,7 @@ const char *serve_menu(const char *path, int sock, const char *addr_str) {
   if ((num_dirents = scandir(path, &p_dirents, menu_filter, menu_sort))
       == -1) {
     log_perror(addr_str, "Couldn't scan resource directory");
-    err_msg = RESPONSE_ERR_OPEN;
+    err_msg = RESPONSE_ERR;
     goto cleanup;
   }
 
@@ -1031,7 +1030,7 @@ const char *serve_menu(const char *path, int sock, const char *addr_str) {
 
     if (!(file_path = malloc(strlen(path) + strlen(file_name) + 2))) {
       log_perror(addr_str, "Couldn't allocate file path");
-      err_msg = RESPONSE_ERR_READ;
+      err_msg = RESPONSE_ERR;
       goto inner_cleanup;
     }
 
@@ -1041,7 +1040,7 @@ const char *serve_menu(const char *path, int sock, const char *addr_str) {
 
     if (sanitize_path(file_path, &sanitized_path)) {
       log_perror(addr_str, "Couldn't sanitize file path");
-      err_msg = RESPONSE_ERR_READ;
+      err_msg = RESPONSE_ERR;
       goto inner_cleanup;
     }
 
@@ -1051,7 +1050,7 @@ const char *serve_menu(const char *path, int sock, const char *addr_str) {
 
     if (!(item_type = get_item_type(sanitized_path))) {
       log_perror(addr_str, "Couldn't determine item type");
-      err_msg = RESPONSE_ERR_READ;
+      err_msg = RESPONSE_ERR;
       goto inner_cleanup;
     }
 
@@ -1065,13 +1064,13 @@ const char *serve_menu(const char *path, int sock, const char *addr_str) {
             config.hostname,
             config.port)) == -1) {
       log_perror(addr_str, "Couldn't format menu entry");
-      err_msg = RESPONSE_ERR_READ;
+      err_msg = RESPONSE_ERR;
       goto inner_cleanup;
     }
 
     if (r_write(sock, direntry_buf, direntry_size) == -1) {
       log_perror(addr_str, "Couldn't send menu entry to client");
-      err_msg = RESPONSE_ERR_READ;
+      err_msg = RESPONSE_ERR;
       goto inner_cleanup;
     }
 
@@ -1121,7 +1120,7 @@ void handle_conn(int sock, const char *addr_str) {
 
   if (sanitize_path(path, &sanitized_path)) {
     log_perror(addr_str, "Couldn't sanitize resource path");
-    err_msg = RESPONSE_ERR_OPEN;
+    err_msg = RESPONSE_ERR;
     goto cleanup;
   }
 
@@ -1129,13 +1128,13 @@ void handle_conn(int sock, const char *addr_str) {
       sanitized_path ? sanitized_path : "forbidden");
 
   if (!sanitized_path) {
-    err_msg = RESPONSE_ERR_OPEN;
+    err_msg = RESPONSE_ERR;
     goto cleanup;
   }
 
   if (!(item_type = get_item_type(sanitized_path))) {
     log_perror(addr_str, "Couldn't determine item type");
-    err_msg = RESPONSE_ERR_OPEN;
+    err_msg = RESPONSE_ERR;
     goto cleanup;
   }
 
