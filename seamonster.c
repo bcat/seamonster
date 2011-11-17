@@ -3,10 +3,12 @@
 #include <getopt.h>
 #include <fcntl.h>
 #include <grp.h>
+#include <limits.h>
 #include <magic.h>
 #include <pwd.h>
 #include <signal.h>
 #include <stdarg.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -42,9 +44,9 @@
 
 #define PID_FILE_MODE     (S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH)
 
-#define PID_BUF_SIZE      22
-#define REQUEST_BUF_SIZE  256
-#define RESPONSE_BUF_SIZE 4096
+#define LOG_BUF_SIZE      PIPE_BUF
+#define REQUEST_BUF_SIZE  PIPE_BUF
+#define RESPONSE_BUF_SIZE PIPE_BUF
 #define DIRENTRY_BUF_SIZE 592
 
 static const int ONE = 1;
@@ -120,6 +122,9 @@ static int r_open(const char *path, int oflag, ...);
 static ssize_t r_read(int fildes, void *buf, size_t nbyte);
 static ssize_t r_write(int fildes, const void *buf, size_t nbyte);
 
+static int asprintf(char **p_s, const char *format, ...);
+static int vasprintf(char **p_s, const char *format, va_list va);
+
 static void log_msg(int pri, const char *addr_str, const char *format,
     va_list varargs);
 static void log_info(const char *addr_str, const char *format, ...);
@@ -172,7 +177,7 @@ static struct {
 
   const char *hostname;
   short port;
-  int backlog;
+  in_port_t backlog;
 
   const char *user;
 
@@ -247,12 +252,59 @@ ssize_t r_write(int fildes, const void *buf, size_t nbyte) {
 }
 
 /*
+ * Write formatted data into a dynamically allocated string whose address will
+ * be stored in the specified memory location.
+ *
+ * Returns the length of the newly-allocated string on success and a negative
+ * value on failure.
+ */
+int asprintf(char **p_s, const char *format, ...) {
+  va_list varargs;
+  int ret;
+
+  va_start(varargs, format);
+  ret = vasprintf(p_s, format, varargs);
+  va_end(varargs);
+
+  return ret;
+}
+
+/*
+ * Write formatted data from the given varargs list into a dynamically
+ * allocated string whose address will be stored in the specified memory
+ * location.
+ *
+ * Returns the length of the newly-allocated string on success and a negative
+ * value on failure.
+ */
+int vasprintf(char **p_s, const char *format, va_list va) {
+  int ret;
+  char *s;
+
+  if ((ret = vsnprintf(NULL, 0, format, va)) < 0) {
+    return ret;
+  }
+
+  if (!(s = malloc(ret + 1))) {
+    return -1;
+  }
+
+  if ((ret = vsnprintf(s, ret + 1, format, va)) < 0) {
+    free(s);
+    return ret;
+  }
+
+  *p_s = s;
+  return ret;
+}
+
+/*
  * Log a formatted message with the specified priority and optionally the
  * specified IP address.
  */
 void log_msg(int pri, const char *addr_str, const char *format,
     va_list varargs) {
-  char buf[PIPE_BUF], *buf_next = buf;
+  char buf[LOG_BUF_SIZE], *buf_next = buf;
   int buf_size = sizeof(buf), str_size;
 
   if (addr_str) {
@@ -336,11 +388,12 @@ void delete_pid_file(void) {
 /*
  * Parse command line arguments into the global config.
  *
- * Returns 0 on success and -1 on error. If an invalid option is provided,
- * then errno will be set to EINVAL.
+ * Returns 0 on success and -1 on error or if a help/version option has been
+ * provided. If an invalid option is provided, errno will be set to EINVAL.
  */
 int parse_config(int argc, char **argv) {
   int opt;
+  long optnum;
 
   config.daemonize = DEFAULT_DAEMONIZE;
   config.port = DEFAULT_PORT;
@@ -350,7 +403,8 @@ int parse_config(int argc, char **argv) {
   while ((opt = getopt_long(argc, argv, OPTSTRING, LONGOPTS, NULL)) != -1) {
     switch (opt) {
     case OPT_HELP:
-      break;
+      /* TODO: Print out help documentation. */
+      return -1;
 
     case OPT_VERSION:
       fprintf(stderr, "%s", VERSION);
@@ -359,21 +413,49 @@ int parse_config(int argc, char **argv) {
     case OPT_HOST:
       free((char *) config.hostname);
       if (!(config.hostname = strdup(optarg))) {
+        perror("Couldn't allocate hostname string");
         return -1;
       }
       break;
 
     case OPT_PORT:
-      config.port = (short) strtol(optarg, NULL, 10);
+      errno = 0;
+      optnum = strtol(optarg, NULL, 10);
+      if (errno) {
+        perror("Couldn't parse port number");
+        return -1;
+      }
+
+      if (optnum < 1 || optnum > 65535) {
+        fprintf(stderr, "Port number is out of range\n");
+        errno = EINVAL;
+        return -1;
+      }
+
+      config.port = (in_port_t) optnum;
       break;
 
     case OPT_BACKLOG:
-      config.backlog = (short) strtol(optarg, NULL, 10);
+      errno = 0;
+      optnum = strtol(optarg, NULL, 10);
+      if (errno) {
+        perror("Couldn't parse backlog size");
+        return -1;
+      }
+
+      if (optnum < INT_MIN || optnum > INT_MAX) {
+        fprintf(stderr, "Backlog size is out of range\n");
+        errno = EINVAL;
+        return -1;
+      }
+
+      config.backlog = (int) strtol(optarg, NULL, 10);
       break;
 
     case OPT_USER:
       free((char *) config.user);
       if (!(config.user = strdup(optarg))) {
+        perror("Couldn't allocate user string");
         return -1;
       }
       break;
@@ -385,17 +467,32 @@ int parse_config(int argc, char **argv) {
     case OPT_PID_FILE:
       free((char *) config.pid_file);
       if (!(config.pid_file = strdup(optarg))) {
+        perror("Couldn't allocate PID file string");
         return -1;
       }
       break;
 
     case OPT_WORKERS:
-      config.num_workers = (short) strtol(optarg, NULL, 10);
+      errno = 0;
+      optnum = strtol(optarg, NULL, 10);
+      if (errno) {
+        perror("Couldn't parse number of workers");
+        return -1;
+      }
+
+      if (optnum < 0 || optnum > SIZE_MAX) {
+        fprintf(stderr, "Number of workers is out of range\n");
+        errno = EINVAL;
+        return -1;
+      }
+
+      config.num_workers = (size_t) optnum;
       break;
 
     case OPT_SRV_PATH:
       free((char *) config.srv_path);
       if (!(config.srv_path = strdup(optarg))) {
+        perror("Couldn't allocate service path string");
         return -1;
       }
       break;
@@ -410,9 +507,14 @@ int parse_config(int argc, char **argv) {
 
   if ((!config.pid_file && !(config.pid_file = strdup(DEFAULT_PID_FILE)))
       || (!config.hostname && !(config.hostname = strdup(DEFAULT_HOSTNAME)))
-      || (!config.user && !(config.user = strdup(DEFAULT_USER)))
-      || (!(config.srv_path = realpath(config.srv_path
-          ? config.srv_path : DEFAULT_SRV_PATH, NULL)))) {
+      || (!config.user && !(config.user = strdup(DEFAULT_USER)))) {
+    perror("Couldn't copy default configuration string");
+    return -1;
+  }
+
+  if (!(config.srv_path = realpath(config.srv_path
+          ? config.srv_path : DEFAULT_SRV_PATH, NULL))) {
+    perror("Couldn't find absolute service path");
     return -1;
   }
 
@@ -426,13 +528,15 @@ int parse_config(int argc, char **argv) {
  * Stevens.
  */
 int daemonize() {
-  char pid_buf[PID_BUF_SIZE];
-  int ret = 0, i, open_max, pid_fd = -1, pid_data_size;
+  char *pid_str = NULL;
+  int ret = 0, i, open_max, pid_fd = -1;
 
   /* Fork once to make sure we're not a process group leader. */
   switch (fork()) {
   case -1:
-    return -1;
+    log_perror(NULL, "Couldn't fork process when daemonizing");
+    ret = -1;
+    goto cleanup;
 
   case 0:
     break;
@@ -443,7 +547,14 @@ int daemonize() {
 
   /* Become the leader of a new session and process group, and change to the
    * root directory. */
-  if (setsid() == -1 || chdir("/")) {
+  if (setsid() == -1) {
+    log_perror(NULL, "Couldn't become a session leader");
+    ret = -1;
+    goto cleanup;
+  }
+
+  if (chdir("/")) {
+    log_perror(NULL, "Couldn't change to root directory");
     ret = -1;
     goto cleanup;
   }
@@ -452,6 +563,7 @@ int daemonize() {
    * us from acquiring a controlling terminal. */
   switch (fork()) {
   case -1:
+    log_perror(NULL, "Couldn't fork process when daemonizing");
     ret = -1;
     goto cleanup;
 
@@ -468,15 +580,39 @@ int daemonize() {
   /* Set a permissive file mode mask. */
   umask(0);
 
+  /* Create a PID file, and prepare to delete it on exit. */
+  if ((pid_fd = r_open(config.pid_file, O_WRONLY | O_CREAT | O_EXCL,
+          PID_FILE_MODE)) == -1) {
+    log_perror(NULL, "Couldn't create PID file for writing");
+    ret = -1;
+    goto cleanup;
+  }
+
+  if (asprintf(&pid_str, "%ld\n", (long) server_pid) < 0) {
+    log_perror(NULL, "Couldn't allocate PID string");
+    ret = -1;
+    goto cleanup;
+  }
+
+  if (r_write(pid_fd, pid_str, strlen(pid_str)) == -1) {
+    log_perror(NULL, "Couldn't write to PID file");
+    ret = -1;
+    goto cleanup;
+  }
+
+  atexit(delete_pid_file);
+
   /* Close all (possibly) open files. */
   errno = 0;
   if ((open_max = (int) sysconf(_SC_OPEN_MAX)) == -1 && errno) {
+    log_perror(NULL, "Couldn't determine maximum file descriptor");
     ret = -1;
     goto cleanup;
   }
 
   for (i = 0; i < ((open_max != -1) ? open_max : OPEN_MAX); ++i) {
     if (r_close(i) == -1 && errno != EBADF) {
+      log_perror(NULL, "Couldn't close file descriptor when daemonizing");
       ret = -1;
       goto cleanup;
     }
@@ -486,37 +622,19 @@ int daemonize() {
   if (r_open("/dev/null", O_RDONLY) != STDIN_FILENO
       || r_open("/dev/null", O_WRONLY) != STDOUT_FILENO
       || dup(STDOUT_FILENO) != STDERR_FILENO) {
+    log_perror(NULL, "Couldn't redirect standard streams to /dev/null");
     ret = -1;
     goto cleanup;
   }
-
-  /* Create a PID file, and prepare to delete it on exit. */
-  if ((pid_fd = r_open(config.pid_file, O_WRONLY | O_CREAT | O_EXCL,
-          PID_FILE_MODE)) == -1) {
-    ret = -1;
-    goto cleanup;
-  }
-
-  pid_data_size = snprintf(pid_buf, sizeof(pid_buf), "%ld\n",
-      (long) server_pid);
-
-  if (pid_data_size < 0 || pid_data_size >= sizeof(pid_buf)) {
-    ret = -1;
-    goto cleanup;
-  }
-
-  if (r_write(pid_fd, pid_buf, pid_data_size) == -1) {
-    ret = -1;
-    goto cleanup;
-  }
-
-  atexit(delete_pid_file);
 
 cleanup:
   r_close(pid_fd);
+  free(pid_str);
+
   if (ret == -1 && pid_fd != -1) {
     unlink(config.pid_file);
   }
+
   return ret;
 }
 
@@ -531,10 +649,27 @@ int create_passive_sock() {
   addr.sin_port = htons(config.port);
   addr.sin_addr.s_addr = htonl(INADDR_ANY);
 
-  return ((sock = socket(PF_INET, SOCK_STREAM, 0)) != -1 &&
-      !setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, &ONE, sizeof(ONE)) &&
-      !bind(sock, (struct sockaddr *) &addr, sizeof(addr)) &&
-      !listen(sock, config.backlog)) ? sock : -1;
+  if ((sock = socket(AF_INET, SOCK_STREAM, 0)) == -1) {
+    log_perror(NULL, "Couldn't create passive socket");
+    return -1;
+  }
+
+  if (setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, &ONE, sizeof(ONE))) {
+    log_perror(NULL, "Couldn't enable port reuse on passive socket");
+    return -1;
+  }
+
+  if (bind(sock, (struct sockaddr *) &addr, sizeof(addr))) {
+    log_perror(NULL, "Couldn't bind passive socket");
+    return -1;
+  }
+
+  if (listen(sock, config.backlog)) {
+    log_perror(NULL, "Couldn't put passive socket in listening mode");
+    return -1;
+  }
+
+  return sock;
 }
 
 /*
@@ -547,11 +682,31 @@ int drop_privs() {
   struct passwd *p_passwd;
 
   errno = 0;
+  if (!(p_passwd = getpwnam(config.user))) {
+    if (errno) {
+      log_perror(NULL, "Couldn't read password file");
+    } else {
+      log_error(NULL, "User does not exist");
+    }
+    return -1;
+  }
 
-  return (!(p_passwd = getpwnam(config.user))
-      || setgid(p_passwd->pw_gid)
-      || setgroups(0, NULL)
-      || setuid(p_passwd->pw_uid)) ? -1 : 0;
+  if (setgid(p_passwd->pw_gid)) {
+    log_perror(NULL, "Couldn't change group");
+    return -1;
+  }
+
+  if (setgroups(0, NULL)) {
+    log_perror(NULL, "Couldn't remove supplementary groups");
+    return -1;
+  }
+
+  if (setuid(p_passwd->pw_uid)) {
+    log_perror(NULL, "Couldn't change user");
+    return -1;
+  }
+
+  return 0;
 }
 
 /*
@@ -565,15 +720,16 @@ pid_t *create_workers(int passive_sock) {
   pid_t *pids = malloc(config.num_workers * sizeof(pid_t));
 
   if (!pids) {
+    log_perror(NULL, "Couldn't allocate array to store worker PIDs");
     return NULL;
   }
 
   for (i = 0; i < config.num_workers; ++i) {
     if ((pids[i] = start_worker(passive_sock)) == -1) {
+      log_perror(NULL, "Couldn't fork worker to handle connections");
       for (j = 0; i < i; ++j) {
         kill(pids[j], SIGTERM);
       }
-      free(pids);
       return NULL;
     }
   }
@@ -797,11 +953,7 @@ const char *serve_file(const char *path, int sock, const char *addr_str,
   }
 
 cleanup:
-  if (file != -1) {
-    if (r_close(file)) {
-      log_perror(addr_str, "Couldn't close resource");
-    }
-  }
+  r_close(file);
 
   return err_msg;
 }
@@ -1019,7 +1171,6 @@ int worker_main(int passive_sock) {
   /* Make sure worker processes don't run as root. */
   if (!getuid()) {
     if (drop_privs()) {
-      log_perror(NULL, "Couldn't drop root privileges");
       return 1;
     }
 
@@ -1087,26 +1238,16 @@ int main(int argc, char **argv) {
   /* Parse command line arguments. */
   errno = 0;
   if (parse_config(argc, argv)) {
-    if (errno) {
-      if (errno != EINVAL) {
-        perror("Couldn't parse server configuration\n");
-      }
-      return 1;
-    }
-    return 0;
+    return !!errno;
   }
 
   /* If requested, run as a daemon and set up logging. */
   if (config.daemonize && daemonize()) {
-    if (daemonize()) {
-      perror("Couldn't run as a daemon");
-      return 1;
-    }
+    return 1;
   }
 
   /* Create a passive socket to listen for connection requests. */
   if ((passive_sock = create_passive_sock()) == -1) {
-    log_perror(NULL, "Couldn't open passive socket");
     return 1;
   }
 
@@ -1117,7 +1258,6 @@ int main(int argc, char **argv) {
       (unsigned long) config.num_workers);
 
   if (!(worker_pids = create_workers(passive_sock))) {
-    log_perror(NULL, "Couldn't fork workers to handle connections");
     return 1;
   }
 
