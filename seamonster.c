@@ -66,10 +66,10 @@ static const struct option LONGOPTS[] = {
 
 /***** Documentation: *****/
 
-#define VERSION                  "seamonster 0.1 / A tiny hack of a Gopher " \
+#define VERSION                  "seamonster 0.1 / a tiny hack of a gopher " \
                                      "server\n" \
-                                 "Copyright (C) 2011--2012 Jonathan " \
-                                     "Rascher\n\n" \
+                                 "copyright (c) 2011-12 jonathan " \
+                                     "rascher\n\n" \
                                  "    May your love reach to the sky\n" \
                                  "    May your sun be always bright\n" \
                                  "    May hope guide you\n" \
