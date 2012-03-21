@@ -40,7 +40,7 @@
 #define DEF_PID_FILE         "/var/run/seamonster.pid"
 #define DEF_HOSTNAME         "localhost"
 #define DEF_PORT             70
-#define DEF_BACKLOG          256
+#define DEF_BACKLOG          128
 #define DEF_USER             "nobody"
 #define DEF_WORKERS          4
 #define DEF_CONNS_PER_WORKER 250
