@@ -31,6 +31,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <grp.h>
+#include <poll.h>
 #include <pwd.h>
 #include <stdlib.h>
 #include <string.h>

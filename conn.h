@@ -24,8 +24,6 @@
 
 #include "common.h"
 
-#include <poll.h>
-
 /***** Connection-specific data: *****/
 
 enum {
@@ -105,69 +103,6 @@ struct conn {
 
   void (*cleanup_response)(struct conn *);
 };
-
-/***** Request handler macros (declaration): *****/
-
-#define RH_DECLARE(name) \
-    void new_##name##_response(struct conn *p_conn);
-
-/***** Request handler macros (definition): *****/
-
-#define RH_BEGIN(name) \
-    struct state_; \
-    static int init_response_(struct conn *); \
-    static int buffer_response_(struct conn *); \
-    static void cleanup_response_(struct conn *); \
-    void new_##name##_response(struct conn *p_conn) { \
-      p_conn->init_response = init_response_; \
-      p_conn->buffer_response = buffer_response_; \
-      p_conn->cleanup_response = cleanup_response_; \
-    }
-
-#define RH_BEGIN_STATE \
-    struct state_ {
-
-#define RH_END_STATE \
-      int : 0; \
-    };
-
-#define RH_BEGIN_INIT \
-    int init_response_(struct conn *p_conn_) { \
-      struct state_ *p_state_ = (struct state_ *)p_conn_->buf; \
-      p_conn_->state_size = sizeof(*p_state_); \
-      { \
-
-#define RH_END_INIT \
-      } \
-    }
-
-#define RH_BEGIN_BUFFER \
-    int buffer_response_(struct conn *p_conn_) { \
-      struct state_ *p_state_ = (struct state_ *)p_conn_->buf; \
-      (void)sizeof(p_state_); /* Suppress unused variable warning. */ \
-      {
-
-#define RH_END_BUFFER \
-      } \
-    }
-
-#define RH_BEGIN_CLEANUP \
-    void cleanup_response_(struct conn *p_conn_) { \
-      struct state_ *p_state_ = (struct state_ *)p_conn_->buf; \
-      (void)sizeof(p_state_); /* Suppress unused variable warning. */ \
-      {
-
-#define RH_END_CLEANUP \
-      } \
-    }
-
-#define RH_END
-
-/***** Request handler macros (implementation): *****/
-
-#define RH_CONN(field) (p_conn_->field)
-
-#define RH_STATE(field) (p_state_->field)
 
 /***** Basic connection functions: *****/
 

@@ -39,17 +39,19 @@ req.o: req.h
 
 req.h: conn.h
 
+res.h: conn.h
+
 resfail.o: common.h resfail.h
 
-resfail.h: conn.h
+resfail.h: res.h
 
 resfile.o: common.h resfile.h
 
-resfile.h: conn.h
+resfile.h: res.h
 
 resmenu.o: common.h resmenu.h
 
-resmenu.h: conn.h
+resmenu.h: res.h
 
 worker.o: common.h conn.h fs.h req.h resfail.h resfile.h resmenu.h worker.h
 

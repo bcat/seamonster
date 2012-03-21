@@ -22,7 +22,7 @@
 
 /***** Dependencies: *****/
 
-#include "conn.h"
+#include "res.h"
 
 /***** Response processing functions: *****/
 
