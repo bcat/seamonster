@@ -1,3 +1,22 @@
+/*
+ *    seamonster / a tiny hack of a gopher server
+ * seamonster.c / main program, config processing, worker management
+ *
+ * copyright © 2011-12 jonathan rascher <jon@bcat.name>.
+ *
+ * Permission to use, copy, modify, and/or distribute this software for any
+ * purpose with or without fee is hereby granted, provided that the above
+ * copyright notice and this permission notice appear in all copies.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES
+ * WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF
+ * MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR ANY
+ * SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES
+ * WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN
+ * ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF OR
+ * IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE
+ */
+
 /***** Dependencies: *****/
 
 #include "common.h"
@@ -17,37 +36,37 @@
 
 /***** Default configuration options: *****/
 
-#define DEFAULT_DAEMONIZE        0
-#define DEFAULT_PID_FILE         "/var/run/seamonster.pid"
-#define DEFAULT_HOSTNAME         "localhost"
-#define DEFAULT_PORT             70
-#define DEFAULT_BACKLOG          256
-#define DEFAULT_USER             "nobody"
-#define DEFAULT_WORKERS          4
-#define DEFAULT_CONNS_PER_WORKER 250
-#define DEFAULT_SRV_PATH         "/srv/gopher"
+#define DEF_DAEMONIZE        0
+#define DEF_PID_FILE         "/var/run/seamonster.pid"
+#define DEF_HOSTNAME         "localhost"
+#define DEF_PORT             70
+#define DEF_BACKLOG          256
+#define DEF_USER             "nobody"
+#define DEF_WORKERS          4
+#define DEF_CONNS_PER_WORKER 250
+#define DEF_SRV_PATH         "/srv/gopher"
 
 /***** Magic numbers: *****/
 
-#define PID_FILE_MODE            (S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH)
+#define PID_FILE_MODE        (S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH)
 
 static const int ONE = 1;
 
 /***** Command line options: *****/
 
-#define OPT_HELP                 '\0'
-#define OPT_VERSION              '\1'
-#define OPT_DAEMONIZE            'd'
-#define OPT_PID_FILE             'P'
-#define OPT_HOST                 'h'
-#define OPT_PORT                 'p'
-#define OPT_BACKLOG              'b'
-#define OPT_USER                 'u'
-#define OPT_WORKERS              'w'
-#define OPT_CONNS_PER_WORKER     'c'
-#define OPT_SRV_PATH             's'
+#define OPT_HELP             '\0'
+#define OPT_VERSION          '\1'
+#define OPT_DAEMONIZE        'd'
+#define OPT_PID_FILE         'P'
+#define OPT_HOST             'h'
+#define OPT_PORT             'p'
+#define OPT_BACKLOG          'b'
+#define OPT_USER             'u'
+#define OPT_WORKERS          'w'
+#define OPT_CONNS_PER_WORKER 'c'
+#define OPT_SRV_PATH         's'
 
-#define OPTSTRING                "dP:h:p:b:u:w:c:s:"
+#define OPTSTRING            "dP:h:p:b:u:w:c:s:"
 
 static const struct option LONGOPTS[] = {
   { "help",             0, NULL, OPT_HELP },
@@ -66,22 +85,22 @@ static const struct option LONGOPTS[] = {
 
 /***** Documentation: *****/
 
-#define VERSION                  "seamonster 0.1 / a tiny hack of a gopher " \
-                                     "server\n" \
-                                 "copyright (c) 2011-12 jonathan " \
-                                     "rascher\n\n" \
-                                 "    May your love reach to the sky\n" \
-                                 "    May your sun be always bright\n" \
-                                 "    May hope guide you\n" \
-                                 "    Your best dreams come true\n\n" \
-                                 "    When we reach out to the sun\n" \
-                                 "    And when you and I are one\n" \
-                                 "    My heart is true\n" \
-                                 "    May love cover you\n" \
-                                 "--- \"Seamonster\" by the violet burning\n"
+#define VERSION              "seamonster 0.1 / a tiny hack of a gopher " \
+                                 "server\n" \
+                             "copyright (c) / 2011-12 jonathan rascher\n" \
+                             "isc-licensed / use, read, hack...\n\n" \
+                             "     May your love reach to the sky\n" \
+                             "     May your sun be always bright\n" \
+                             "     May hope guide you\n" \
+                             "     Your best dreams come true\n\n" \
+                             "     When we reach out to the sun\n" \
+                             "     And when you and I are one\n" \
+                             "     My heart is true\n" \
+                             "     May love cover you\n\n" \
+                             "--- \"Seamonster\" by the violet burning\n"
 
-#define USAGE                    "Usage: %s [options]\n\n"
-#define USAGE_HELP               "Try %s --help for more information\n"
+#define USAGE                "Usage: %s [options]\n\n"
+#define USAGE_HELP           "Try %s --help for more information\n"
 
 /***** Global variables: *****/
 
@@ -123,11 +142,11 @@ static int parse_config(int argc, char **argv) {
   int opt;
   long optnum;
 
-  g_config.daemonize        = DEFAULT_DAEMONIZE;
-  g_config.port             = DEFAULT_PORT;
-  g_config.backlog          = DEFAULT_BACKLOG;
-  g_config.num_workers      = DEFAULT_WORKERS;
-  g_config.conns_per_worker = DEFAULT_CONNS_PER_WORKER;
+  g_config.daemonize        = DEF_DAEMONIZE;
+  g_config.port             = DEF_PORT;
+  g_config.backlog          = DEF_BACKLOG;
+  g_config.num_workers      = DEF_WORKERS;
+  g_config.conns_per_worker = DEF_CONNS_PER_WORKER;
 
   while ((opt = getopt_long(argc, argv, OPTSTRING, LONGOPTS, NULL)) != -1) {
     switch (opt) {
@@ -251,16 +270,15 @@ static int parse_config(int argc, char **argv) {
     }
   }
 
-  if ((!g_config.pid_file && !(g_config.pid_file = strdup(DEFAULT_PID_FILE)))
-      || (!g_config.hostname
-          && !(g_config.hostname = strdup(DEFAULT_HOSTNAME)))
-      || (!g_config.user && !(g_config.user = strdup(DEFAULT_USER)))) {
+  if ((!g_config.pid_file && !(g_config.pid_file = strdup(DEF_PID_FILE)))
+      || (!g_config.hostname && !(g_config.hostname = strdup(DEF_HOSTNAME)))
+      || (!g_config.user && !(g_config.user = strdup(DEF_USER)))) {
     perror("Couldn't copy default configuration string");
     return -1;
   }
 
   if (!(g_config.srv_path = realpath(g_config.srv_path
-          ? g_config.srv_path : DEFAULT_SRV_PATH, NULL))) {
+          ? g_config.srv_path : DEF_SRV_PATH, NULL))) {
     perror("Couldn't find absolute service path");
     return -1;
   }
