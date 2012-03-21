@@ -37,11 +37,6 @@
 #include <string.h>
 #include <unistd.h>
 
-/***** Gopher protocol strings: *****/
-
-#define RESPONSE_EOM      ".\r\n"
-#define RESPONSE_EOM_SIZE (sizeof(RESPONSE_EOM) - 1)
-
 /***** Connection state variables: *****/
 
 struct conn *conns;
@@ -184,7 +179,6 @@ static void handle_conn_delete(struct conn *p_conn, struct pollfd *p_pollfd) {
 
 static void handle_conn_write(struct conn *p_conn, struct pollfd *p_pollfd) {
   int done = 0;
-  size_t buf_size;
   ssize_t send_size;
 
   /* Log some debug info. */
@@ -270,27 +264,19 @@ static void handle_conn_write(struct conn *p_conn, struct pollfd *p_pollfd) {
   if (!p_conn->data_size) {
     p_conn->buf_next = p_conn->buf + p_conn->state_size;
 
-    if (p_conn->stage == STAGE_RESPONSE_EOM
-        || p_conn->buffer_response(p_conn)) {
+    if (p_conn->buffer_response(p_conn)) {
       done = 1;
       goto cleanup;
     }
   }
 
-  buf_size = sizeof(p_conn->buf) - p_conn->state_size;
-
-  if (p_conn->data_size <= buf_size - RESPONSE_EOM_SIZE) {
-    if (is_item_type_textual(p_conn->item_type)) {
-      memcpy(p_conn->buf_next + p_conn->data_size, RESPONSE_EOM,
-          RESPONSE_EOM_SIZE);
-      p_conn->data_size += RESPONSE_EOM_SIZE;
-    }
-
-    p_conn->stage = STAGE_RESPONSE_EOM;
+  if (!p_conn->data_size) {
+    done = 1;
+    goto cleanup;
   }
 
   if ((send_size
-        = r_write(p_conn->sock, p_conn->buf_next, p_conn->data_size))
+          = r_write(p_conn->sock, p_conn->buf_next, p_conn->data_size))
       == -1) {
     if (errno != EAGAIN && errno != EWOULDBLOCK) {
       done = 1;
