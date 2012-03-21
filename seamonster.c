@@ -75,9 +75,9 @@ static const struct option LONGOPTS[] = {
                                  "    May hope guide you\n" \
                                  "    Your best dreams come true\n\n" \
                                  "    When we reach out to the sun\n" \
-                                 "    When you and I are one\n" \
+                                 "    And when you and I are one\n" \
                                  "    My heart is true\n" \
-                                 "    Let love cover you\n" \
+                                 "    May love cover you\n" \
                                  "--- \"Seamonster\" by the violet burning\n"
 
 #define USAGE                    "Usage: %s [options]\n\n"
