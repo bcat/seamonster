@@ -1,11 +1,11 @@
 #ifndef WORKER_H
-# define WORKER_H
+#define WORKER_H
 
 /***** Dependencies: *****/
 
-# include <sys/wait.h>
+#include <sys/wait.h>
 
-/***** Functions: *****/
+/***** Main worker functions: *****/
 
 /*
  * Fork a new worker process to handle connections to the specified passive

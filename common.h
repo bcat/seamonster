@@ -1,26 +1,31 @@
-#ifndef    COMMON_H
-# define   COMMON_H
+#ifndef COMMON_H
+#define COMMON_H
 
 /***** Dependencies: *****/
 
-# include <limits.h>
-# include <signal.h>
-# include <stdarg.h>
+#include <limits.h>
+#include <signal.h>
+#include <stdarg.h>
 
-# include <arpa/inet.h>
+#include <arpa/inet.h>
 
-# include <sys/socket.h>
-# include <sys/wait.h>
+#include <sys/socket.h>
+#include <sys/wait.h>
 
 /***** Explicit declarations of POSIX limits: *****/
 
-# ifndef OPEN_MAX
-#   define OPEN_MAX 1024
-# endif
+#ifndef OPEN_MAX
+#define OPEN_MAX      1024
+#endif
 
-# ifndef PIPE_BUF
-#   define PIPE_BUF _POSIX_PIPE_BUF
-# endif
+#ifndef PIPE_BUF
+#define PIPE_BUF      _POSIX_PIPE_BUF
+#endif
+
+/***** Buffer sizes, all in one place: *****/
+
+#define LOG_BUF_SIZE  PIPE_BUF
+#define CONN_BUF_SIZE 16384
 
 /***** Configuration data structure: *****/
 
@@ -36,6 +41,8 @@ struct config {
 
   size_t num_workers;
 
+  size_t conns_per_worker;
+
   const char *srv_path;
 };
 
@@ -47,6 +54,12 @@ struct config {
  */
 void log_msg(int pri, const char *addr_str, const char *format,
     va_list varargs);
+
+/*
+ * Log a formatted message at DEBUG priority, optionally including the
+ * specified IP address.
+ */
+void log_debug(const char *addr_str, const char *format, ...);
 
 /*
  * Log a formatted message at INFO priority, optionally including the
@@ -65,6 +78,12 @@ void log_warn(const char *addr_str, const char *format, ...);
  * specified IP address.
  */
 void log_error(const char *addr_str, const char *format, ...);
+
+/*
+ * Log a message associated with the current value of errno at WARN priority,
+ * optionally including the specified IP address.
+ */
+void log_pwarn(const char *addr_str, const char *s);
 
 /*
  * Log a message associated with the current value of errno at ERR priority,
@@ -119,8 +138,8 @@ int r_open(const char *path, int oflag, ...);
 ssize_t r_read(int fildes, void *buf, size_t nbyte);
 
 /*
- * Write the specified number of bytes to the given file descriptor, retrying
- * when interrupted.
+ * Write at most the specified number of bytes to the given file descriptor,
+ * retrying when interrupted.
  *
  * Returns the total number of bytes written on success and -1 on error.
  */

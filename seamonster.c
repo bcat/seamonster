@@ -17,67 +17,71 @@
 
 /***** Default configuration options: *****/
 
-#define DEFAULT_DAEMONIZE 0
-#define DEFAULT_PID_FILE  "/var/run/seamonster.pid"
-#define DEFAULT_HOSTNAME  "localhost"
-#define DEFAULT_PORT      70
-#define DEFAULT_BACKLOG   256
-#define DEFAULT_USER      "nobody"
-#define DEFAULT_WORKERS   4
-#define DEFAULT_SRV_PATH  "/srv/gopher"
+#define DEFAULT_DAEMONIZE        0
+#define DEFAULT_PID_FILE         "/var/run/seamonster.pid"
+#define DEFAULT_HOSTNAME         "localhost"
+#define DEFAULT_PORT             70
+#define DEFAULT_BACKLOG          256
+#define DEFAULT_USER             "nobody"
+#define DEFAULT_WORKERS          4
+#define DEFAULT_CONNS_PER_WORKER 250
+#define DEFAULT_SRV_PATH         "/srv/gopher"
 
 /***** Magic numbers: *****/
 
-#define PID_FILE_MODE     (S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH)
+#define PID_FILE_MODE            (S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH)
 
 static const int ONE = 1;
 
 /***** Command line options: *****/
 
-#define OPT_HELP          '\0'
-#define OPT_VERSION       '\1'
-#define OPT_DAEMONIZE     'd'
-#define OPT_PID_FILE      'P'
-#define OPT_HOST          'h'
-#define OPT_PORT          'p'
-#define OPT_BACKLOG       'b'
-#define OPT_USER          'u'
-#define OPT_WORKERS       'w'
-#define OPT_SRV_PATH      's'
+#define OPT_HELP                 '\0'
+#define OPT_VERSION              '\1'
+#define OPT_DAEMONIZE            'd'
+#define OPT_PID_FILE             'P'
+#define OPT_HOST                 'h'
+#define OPT_PORT                 'p'
+#define OPT_BACKLOG              'b'
+#define OPT_USER                 'u'
+#define OPT_WORKERS              'w'
+#define OPT_CONNS_PER_WORKER     'c'
+#define OPT_SRV_PATH             's'
 
-#define OPTSTRING         "dP:h:p:b:u:w:s:"
+#define OPTSTRING                "dP:h:p:b:u:w:c:s:"
 
 static const struct option LONGOPTS[] = {
-  { "help",      0, NULL, OPT_HELP },
-  { "version",   0, NULL, OPT_VERSION },
-  { "daemonize", 0, NULL, OPT_DAEMONIZE },
-  { "pid-file",  1, NULL, OPT_PID_FILE },
-  { "host",      1, NULL, OPT_HOST },
-  { "port",      1, NULL, OPT_PORT },
-  { "backlog",   1, NULL, OPT_BACKLOG },
-  { "user",      1, NULL, OPT_USER },
-  { "workers",   1, NULL, OPT_WORKERS },
-  { "srv-path",  1, NULL, OPT_SRV_PATH },
+  { "help",             0, NULL, OPT_HELP },
+  { "version",          0, NULL, OPT_VERSION },
+  { "daemonize",        0, NULL, OPT_DAEMONIZE },
+  { "pid-file",         1, NULL, OPT_PID_FILE },
+  { "host",             1, NULL, OPT_HOST },
+  { "port",             1, NULL, OPT_PORT },
+  { "backlog",          1, NULL, OPT_BACKLOG },
+  { "user",             1, NULL, OPT_USER },
+  { "workers",          1, NULL, OPT_WORKERS },
+  { "conns-per-worker", 1, NULL, OPT_CONNS_PER_WORKER },
+  { "srv-path",         1, NULL, OPT_SRV_PATH },
   { 0 }
 };
 
 /***** Documentation: *****/
 
-#define VERSION           "seamonster 0.1 / A tiny hack of a Gopher " \
-                              "server\n" \
-                          "Copyright (C) 2011--2012 Jonathan Rascher\n\n" \
-                          "    May your love reach to the sky\n" \
-                          "    May your sun be always bright\n" \
-                          "    May hope guide you\n" \
-                          "    Your best dreams come true\n\n" \
-                          "    When we reach out to the sun\n" \
-                          "    When you and I are one\n" \
-                          "    My heart is true\n" \
-                          "    Let love cover you\n" \
-                          "--- \"Seamonster\" by the violet burning\n"
+#define VERSION                  "seamonster 0.1 / A tiny hack of a Gopher " \
+                                     "server\n" \
+                                 "Copyright (C) 2011--2012 Jonathan " \
+                                     "Rascher\n\n" \
+                                 "    May your love reach to the sky\n" \
+                                 "    May your sun be always bright\n" \
+                                 "    May hope guide you\n" \
+                                 "    Your best dreams come true\n\n" \
+                                 "    When we reach out to the sun\n" \
+                                 "    When you and I are one\n" \
+                                 "    My heart is true\n" \
+                                 "    Let love cover you\n" \
+                                 "--- \"Seamonster\" by the violet burning\n"
 
-#define USAGE             "Usage: %s [options]\n\n"
-#define USAGE_HELP        "Try %s --help for more information\n"
+#define USAGE                    "Usage: %s [options]\n\n"
+#define USAGE_HELP               "Try %s --help for more information\n"
 
 /***** Global variables: *****/
 
@@ -119,10 +123,11 @@ static int parse_config(int argc, char **argv) {
   int opt;
   long optnum;
 
-  g_config.daemonize   = DEFAULT_DAEMONIZE;
-  g_config.port        = DEFAULT_PORT;
-  g_config.backlog     = DEFAULT_BACKLOG;
-  g_config.num_workers = DEFAULT_WORKERS;
+  g_config.daemonize        = DEFAULT_DAEMONIZE;
+  g_config.port             = DEFAULT_PORT;
+  g_config.backlog          = DEFAULT_BACKLOG;
+  g_config.num_workers      = DEFAULT_WORKERS;
+  g_config.conns_per_worker = DEFAULT_CONNS_PER_WORKER;
 
   while ((opt = getopt_long(argc, argv, OPTSTRING, LONGOPTS, NULL)) != -1) {
     switch (opt) {
@@ -211,6 +216,23 @@ static int parse_config(int argc, char **argv) {
       }
 
       g_config.num_workers = (size_t) optnum;
+      break;
+
+    case OPT_CONNS_PER_WORKER:
+      errno = 0;
+      optnum = strtol(optarg, NULL, 10);
+      if (errno) {
+        perror("Couldn't parse number of connections per worker");
+        return -1;
+      }
+
+      if (optnum < 0 || optnum > SIZE_MAX) {
+        fprintf(stderr, "Number of connections per worker is out of range\n");
+        errno = EINVAL;
+        return -1;
+      }
+
+      g_config.conns_per_worker = (size_t) optnum;
       break;
 
     case OPT_SRV_PATH:
@@ -381,6 +403,11 @@ static int create_passive_sock() {
     return -1;
   }
 
+  if (fcntl(sock, F_SETFL, O_NONBLOCK) == -1) {
+    log_perror(NULL, "Couldn't put passive socket in nonblocking mode");
+    return -1;
+  }
+
   if (setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, &ONE, sizeof(ONE))) {
     log_perror(NULL, "Couldn't enable port reuse on passive socket");
     return -1;
@@ -467,8 +494,12 @@ int main(int argc, char **argv) {
   log_info(NULL, "Listening on port %hu", g_config.port);
 
   /* Fork off some children to handle clients. */
-  log_info(NULL, "Starting with %lu workers",
-      (unsigned long) g_config.num_workers);
+  log_info(NULL, "Starting with %lu worker%s",
+      (unsigned long) g_config.num_workers,
+      g_config.num_workers != 1 ? "s" : "");
+  log_info(NULL, "Serving %lu connection%s each",
+      (unsigned long) g_config.conns_per_worker,
+      g_config.conns_per_worker != 1 ? "s" : "");
 
   if (!(worker_pids = create_workers(passive_sock))) {
     return 1;

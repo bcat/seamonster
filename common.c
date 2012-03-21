@@ -10,10 +10,6 @@
 #include <syslog.h>
 #include <unistd.h>
 
-/***** Buffer sizes: *****/
-
-#define LOG_BUF_SIZE PIPE_BUF
-
 /***** Logging functions: *****/
 
 void log_msg(int pri, const char *addr_str, const char *format,
@@ -35,6 +31,14 @@ void log_msg(int pri, const char *addr_str, const char *format,
   buf_next += (str_size < buf_size) ? str_size : buf_size;
 
   syslog(pri, "%s", buf);
+}
+
+void log_debug(const char *addr_str, const char *format, ...) {
+  va_list varargs;
+
+  va_start(varargs, format);
+  log_msg(LOG_INFO, addr_str, format, varargs);
+  va_end(varargs);
 }
 
 void log_info(const char *addr_str, const char *format, ...) {
@@ -59,6 +63,10 @@ void log_error(const char *addr_str, const char *format, ...) {
   va_start(varargs, format);
   log_msg(LOG_ERR, addr_str, format, varargs);
   va_end(varargs);
+}
+
+void log_pwarn(const char *addr_str, const char *s) {
+  log_warn(addr_str, "%s: %s", s, strerror(errno));
 }
 
 void log_perror(const char *addr_str, const char *s) {
@@ -144,12 +152,7 @@ ssize_t r_read(int fildes, void *buf, size_t nbytes) {
 
 ssize_t r_write(int fildes, const void *buf, size_t nbyte) {
   ssize_t ret;
-  do {
-    while ((ret = write(fildes, buf, nbyte)) == -1
-        && errno == EINTR);
-    buf = (const char *) buf + ret;
-    nbyte -= ret;
-  } while (nbyte && ret != -1);
+  while ((ret = write(fildes, buf, nbyte)) == -1 && errno == EINTR);
   return ret;
 }
 

@@ -1,431 +1,39 @@
 /***** Dependencies: *****/
 
 #include "common.h"
+#include "conn.h"
+#include "fs.h"
+#include "req.h"
+#include "resfail.h"
+#include "resfile.h"
+#include "resmenu.h"
 #include "worker.h"
 
-#include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <grp.h>
-#include <magic.h>
 #include <pwd.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
 
-#include <sys/stat.h>
-
-/***** Buffer sizes: *****/
-
-#define REQUEST_BUF_SIZE  PIPE_BUF
-#define RESPONSE_BUF_SIZE PIPE_BUF
-
 /***** Gopher protocol strings: *****/
 
 #define RESPONSE_EOM      ".\r\n"
-#define RESPONSE_ERR      "3Error reading resource\tinvalid.invalid\t70\r\n" \
-                              RESPONSE_EOM
+#define RESPONSE_EOM_SIZE (sizeof(RESPONSE_EOM) - 1)
 
-/***** Gopher item type characters: *****/
+/***** Connection state variables: *****/
 
-#define ITEM_TYPE_TXT     '0'
-#define ITEM_TYPE_DIR     '1'
-#define ITEM_TYPE_BIN     '9'
-#define ITEM_TYPE_GIF     'g'
-#define ITEM_TYPE_HTM     'h'
-#define ITEM_TYPE_IMG     'I'
+struct conn *conns;
 
-/***** Request processing functions: *****/
+struct pollfd *pollfds, *conn_pollfds, *p_passive_pollfd;
 
-/*
- * Parse a tab-delimited Gopher request.
- *
- * Returns a pointer to an array of strings representing the tab-delimited
- * request fields on success and NULL on error.
- */
-static char **parse_request(int sock) {
-  int done = 0;
-  size_t i, num_chunks = 1;
-  char *buf_start = NULL, *buf_next = NULL, *buf_end = NULL, **request;
+struct conn **free_conn_stack, **free_conn_top;
 
-  do {
-    ssize_t recv_size;
+struct conn **pollfd_idxs_to_conns;
+size_t num_active_conns;
 
-    if (buf_next == buf_end) {
-      size_t data_size = buf_next - buf_start,
-          buf_size = buf_start ? buf_end - buf_start : REQUEST_BUF_SIZE;
-
-      if (!(buf_start = realloc(buf_start, buf_size * 2))) {
-        return NULL;
-      }
-
-      buf_next = buf_start + data_size;
-      buf_end = buf_start + buf_size * 2;
-    }
-
-    recv_size = r_read(sock, buf_next, buf_end - buf_next);
-
-    switch(recv_size) {
-    case -1:
-      free(buf_start);
-      return NULL;
-
-    case 0:
-      free(buf_start);
-      num_chunks = 0;
-      done = 1;
-      break;
-
-    default:
-      do {
-        switch (*buf_next++) {
-        case '\t':
-          ++num_chunks;
-          break;
-
-        case '\r':
-          if (buf_next != buf_end && *buf_next == '\n') {
-            *(buf_next - 1) = '\0';
-            done = 1;
-          }
-        }
-      } while (--recv_size && !done);
-    }
-  } while (!done);
-
-  if (!(request = malloc((num_chunks + 1) * sizeof(*request)))) {
-    free(buf_start);
-    return NULL;
-  }
-
-  for (i = 0; i < num_chunks; ++i) {
-    request[i] = buf_start;
-    buf_start = strchr(buf_start, '\t');
-
-    if (buf_start) {
-      *buf_start++ = '\0';
-    }
-  }
-
-  request[num_chunks] = NULL;
-
-  return request;
-}
-
-/*
- * Free the resources associated with a parsed Gopher request.
- */
-static void free_request(const char *const *request) {
-  if (request) {
-    free((char *) *request);
-  }
-  free((const char **) request);
-}
-
-/*
- * Sanitize the given path by converting it to an absolute path which must be
- * rooted in the path specified in the server configuration.
- *
- * Returns 0 on success and -1 on error. If the path referred to by in_path
- * lies within the srv_path hierarchy, then the out_path will be reassigned to
- * point to reference the sanitized (absolute) path. If in_path refers to an
- * invalid location, then out_put will be assigned a NULL pointer.
- */
-static int sanitize_path(const char *in_path, char **out_path) {
-  if (!(*out_path = realpath(in_path, NULL))) {
-    return -1;
-  }
-
-  if (strstr(*out_path, g_config.srv_path) != *out_path) {
-    free(*out_path);
-    *out_path = NULL;
-  }
-
-  return 0;
-}
-
-/***** Response processing functions (general): *****/
-
-/*
- * Return the Gopher protocol item type character associated with the
- * specified path, using the magic library to differentiate text files,
- * images, and arbitrary binary files.
- *
- * Returns a Gopher item type character on success and '\0' on error.
- */
-static char get_item_type(const char *path) {
-  char item_type = ITEM_TYPE_BIN;
-  const char *mime_type = NULL;
-  struct stat path_stat;
-  magic_t cookie = NULL;
-
-  if (stat(path, &path_stat)) {
-    goto cleanup;
-  }
-
-  if (S_ISDIR(path_stat.st_mode)) {
-    item_type = ITEM_TYPE_DIR;
-    goto cleanup;
-  }
-
-  if (!(cookie = magic_open(MAGIC_MIME_TYPE))
-      || magic_load(cookie, NULL)
-      || !(mime_type = magic_file(cookie, path))) {
-    item_type = '\0';
-    goto cleanup;
-  }
-
-  if (strstr(mime_type, "text/") == mime_type) {
-    item_type = !strcmp(mime_type + sizeof("text/") - 1, "html")
-        ? ITEM_TYPE_HTM
-        : ITEM_TYPE_TXT;
-  } else if (strstr(mime_type, "image/") == mime_type) {
-    item_type = !strcmp(mime_type + sizeof("image/") - 1, "gif")
-        ? ITEM_TYPE_GIF
-        : ITEM_TYPE_IMG;
-  }
-
-cleanup:
-  if (cookie) {
-    magic_close(cookie);
-  }
-
-  return item_type;
-}
-
-/***** Response processing functions (files): *****/
-
-/*
- * Serve a Gopher protocol file response (text or binary, as specified) to the
- * given socket.
- *
- * Returns NULL on success and a Gopher error response on failure.
- */
-static const char *serve_file(const char *path, int sock, const char *addr_str,
-    int is_txt) {
-  const char *err_msg = NULL;
-  char buf[RESPONSE_BUF_SIZE];
-  ssize_t data_size;
-  int file;
-
-  if ((file = r_open(path, O_RDONLY)) == -1) {
-    log_perror(addr_str, "Couldn't open resource");
-    err_msg = RESPONSE_ERR;
-    goto cleanup;
-  }
-
-  while ((data_size = r_read(file, buf, sizeof(buf)))) {
-    if (data_size == -1) {
-      log_perror(addr_str, "Couldn't read resource");
-      err_msg = RESPONSE_ERR;
-      goto cleanup;
-    }
-
-    if (r_write(sock, buf, data_size) == -1) {
-      log_perror(addr_str, "Couldn't send resource to client");
-      goto cleanup;
-    }
-  }
-
-  if (is_txt) {
-    if (r_write(sock, RESPONSE_EOM, sizeof(RESPONSE_EOM)) == -1) {
-      log_perror(addr_str, "Couldn't send resource to client");
-      goto cleanup;
-    }
-  }
-
-cleanup:
-  r_close(file);
-
-  return err_msg;
-}
-
-/***** Response processing functions (directory): *****/
-
-/*
- * scandir filter for generating Gopher menu responses. The current directory
- * entry (.) will be filtered out, as will directory entries whose names
- * contain characters that are not valid in Gopher menu responses.
- */
-static int menu_filter(const struct dirent *p_dirent) {
-  const char *name = p_dirent->d_name;
-  char ch;
-
-  if (name[0] == '.' && name[1] == '\0') {
-    return 0;
-  }
-
-  while ((ch = *name++)) {
-    if (ch == '\t' || ch == '\r' || ch == '\n') {
-      return 0;
-    }
-  }
-
-  return 1;
-}
-
-/*
- * scandir sort function for generating Gopher menu responses. The parent
- * directory entry (..) is always sorted first, and the remaining directory
- * entries are ordered according to strcoll.
- */
-static int menu_sort(const struct dirent **pp_dirent1,
-    const struct dirent **pp_dirent2) {
-  const char *name1 = (*pp_dirent1)->d_name, *name2 = (*pp_dirent2)->d_name;
-
-  if (!strcmp(name1, "..")) {
-    return !!strcmp(name2, "..");
-  } else {
-    return strcoll(name1, name2);
-  }
-}
-
-/*
- * Serve a Gopher protocol menu response to the given socket.
- *
- * Returns NULL on success and a Gopher error response on failure.
- */
-static const char *serve_menu(const char *path, int sock,
-    const char *addr_str) {
-  const char *err_msg = NULL;
-  char item_type;
-  struct dirent **p_dirents = NULL;
-  int num_dirents;
-
-  if ((num_dirents = scandir(path, &p_dirents, menu_filter, menu_sort))
-      == -1) {
-    log_perror(addr_str, "Couldn't scan resource directory");
-    err_msg = RESPONSE_ERR;
-    goto cleanup;
-  }
-
-  while (num_dirents-- && !err_msg) {
-    const char *file_name = p_dirents[num_dirents]->d_name;
-    int direntry_len;
-    char *file_path = NULL, *sanitized_path = NULL, *direntry = NULL;
-
-    if (asprintf(&file_path, "%s/%s", path, file_name) < 0) {
-      log_perror(addr_str, "Couldn't allocate file path");
-      err_msg = RESPONSE_ERR;
-      goto inner_cleanup;
-    }
-
-    if (sanitize_path(file_path, &sanitized_path)) {
-      log_perror(addr_str, "Couldn't sanitize file path");
-      err_msg = RESPONSE_ERR;
-      goto inner_cleanup;
-    }
-
-    if (!sanitized_path) {
-      goto inner_cleanup;
-    }
-
-    if (!(item_type = get_item_type(sanitized_path))) {
-      log_perror(addr_str, "Couldn't determine item type");
-      err_msg = RESPONSE_ERR;
-      goto inner_cleanup;
-    }
-
-    if ((direntry_len = asprintf(
-            &direntry,
-            "%c%.70s\t%.255s\t%.255s\t%hd\r\n",
-            item_type,
-            file_name,
-            sanitized_path + strlen(g_config.srv_path),
-            g_config.hostname,
-            g_config.port)) < 0) {
-      log_perror(addr_str, "Couldn't format menu entry");
-      err_msg = RESPONSE_ERR;
-      goto inner_cleanup;
-    }
-
-    if (r_write(sock, direntry, direntry_len) == -1) {
-      log_perror(addr_str, "Couldn't send menu entry to client");
-      err_msg = RESPONSE_ERR;
-      goto inner_cleanup;
-    }
-
-  inner_cleanup:
-    free(direntry);
-    free(sanitized_path);
-    free(file_path);
-    free(p_dirents[num_dirents]);
-  }
-
-  if (r_write(sock, RESPONSE_EOM, sizeof(RESPONSE_EOM)) == -1) {
-    log_perror(addr_str, "Couldn't send resource to client");
-    goto cleanup;
-  }
-
-cleanup:
-  free(p_dirents);
-
-  return err_msg;
-}
-
-/***** Main worker process code: *****/
-
-/*
- * Handle an incoming connection with the specified socket and IP address.
- */
-static void handle_conn(int sock, const char *addr_str) {
-  const char *const *request = NULL, *const *request_iter, *selector,
-      *err_msg = NULL;
-  char *path = NULL, *sanitized_path = NULL, item_type;
-
-  if (!(request_iter = request = (const char *const *) parse_request(sock))) {
-    log_perror(addr_str, "Couldn't read or parse request");
-    goto cleanup;
-  }
-
-  if (!(selector = *request_iter++)) {
-    log_error(addr_str, "Request does not contain a selector");
-    goto cleanup;
-  }
-
-  if (asprintf(&path, "%s/%s", g_config.srv_path, selector) < 0) {
-    log_perror(addr_str, "Couldn't allocate resource path");
-    goto cleanup;
-  }
-
-  if (sanitize_path(path, &sanitized_path)) {
-    log_perror(addr_str, "Couldn't sanitize resource path");
-    err_msg = RESPONSE_ERR;
-    goto cleanup;
-  }
-
-  log_info(addr_str, "Accepted request for `%s` (%s)", selector,
-      sanitized_path ? sanitized_path : "forbidden");
-
-  if (!sanitized_path) {
-    err_msg = RESPONSE_ERR;
-    goto cleanup;
-  }
-
-  if (!(item_type = get_item_type(sanitized_path))) {
-    log_perror(addr_str, "Couldn't determine item type");
-    err_msg = RESPONSE_ERR;
-    goto cleanup;
-  }
-
-  err_msg = (item_type == ITEM_TYPE_DIR)
-      ? serve_menu(sanitized_path, sock, addr_str)
-      : serve_file(sanitized_path, sock, addr_str,
-          item_type == ITEM_TYPE_TXT);
-
-  if (*request_iter) {
-    log_warn(addr_str, "Request contains unexpected element");
-  }
-
-cleanup:
-  if (err_msg) {
-    r_write(sock, err_msg, strlen(err_msg));
-  }
-
-  free(sanitized_path);
-  free(path);
-  free_request(request);
-}
+/***** Startup functions: *****/
 
 /*
  * Drop root privileges and run as the user specified in the server
@@ -464,20 +72,321 @@ static int drop_privs() {
   return 0;
 }
 
+/*
+ * Allocate and initialize connection state arrays.
+ *
+ * Returns 0 on success and -1 on error.
+ */
+static int create_conn_state(int passive_sock) {
+  int ret = 0;
+  size_t num_conns = g_config.conns_per_worker, i;
+
+  /* Allocate memory. */
+  conns = NULL;
+  pollfds = NULL;
+  free_conn_stack = NULL;
+  pollfd_idxs_to_conns = NULL;
+
+  if (!(conns = malloc(num_conns * sizeof(*conns)))
+      || !(pollfds = malloc((num_conns + 1) * sizeof(*pollfds)))
+      || !(free_conn_stack = malloc(num_conns * sizeof(*free_conn_stack)))
+      || !(pollfd_idxs_to_conns
+          = calloc(num_conns, sizeof(*pollfd_idxs_to_conns)))) {
+    log_perror(NULL, "Couldn't allocate connection state arrays");
+    ret = -1;
+    goto cleanup;
+  }
+
+  /* Initialize connection state slots and stack of pointers to free
+   * connection slots. */
+  free_conn_top = free_conn_stack;
+
+  for(i = 0; i < num_conns; ++i) {
+    struct conn *p_conn = conns + i;
+    p_conn->conn_idx = i;
+    init_conn(p_conn);
+    *(free_conn_top++) = p_conn;
+  }
+
+  /* Initialize socket pollfds. */
+  for (i = 0; i <= num_conns; ++i) {
+    struct pollfd *p_pollfd = pollfds + i;
+    p_pollfd->fd = -1;
+    p_pollfd->events = 0;
+    p_pollfd->revents = 0;
+  }
+
+  /* Initialize pollfd for passive socket. */
+  conn_pollfds = pollfds + 1;
+  p_passive_pollfd = pollfds;
+  p_passive_pollfd->fd = passive_sock;
+
+cleanup:
+  if (ret) {
+    free(pollfd_idxs_to_conns);
+    free(free_conn_stack);
+    free(pollfds);
+    free(conns);
+  }
+  return ret;
+}
+
+/***** Connection management functions: *****/
+
+static void handle_conn_delete(struct conn *p_conn, struct pollfd *p_pollfd) {
+  struct pollfd *p_last_pollfd = conn_pollfds + --num_active_conns;
+  struct conn *p_last_conn = pollfd_idxs_to_conns[num_active_conns];
+
+  /* Log some debug info. */
+  log_debug(NULL, "Deallocating pollfd %lu from connection %lu/socket %d",
+      (unsigned long) p_conn->pollfd_idx,
+      (unsigned long) p_conn->conn_idx,
+      p_conn->sock);
+
+  /* Return the connection slot to the free stack. */
+  *(free_conn_top++) = p_conn;
+
+  /* Overwrite the connection's pollfd with the last active pollfd, deleting
+   * the old pollfd in constant time. */
+  memcpy(p_pollfd, p_last_pollfd, sizeof(*p_pollfd));
+  p_last_pollfd->fd = -1;
+  p_last_pollfd->events = 0;
+  p_last_pollfd->revents = 0;
+
+  /* Update the pollfd--connection mappings. */
+  pollfd_idxs_to_conns[p_conn->pollfd_idx] = p_last_conn;
+  pollfd_idxs_to_conns[num_active_conns] = NULL;
+  p_last_conn->pollfd_idx = p_conn->pollfd_idx;
+
+  /* Close the connection socket and free its associated resources. */
+  cleanup_conn(p_conn);
+}
+
+static void handle_conn_write(struct conn *p_conn, struct pollfd *p_pollfd) {
+  int done = 0;
+  size_t buf_size;
+  ssize_t send_size;
+
+  /* Log some debug info. */
+  log_debug(NULL, "Writing connection %lu/socket %d (assigned pollfd %lu)",
+      (unsigned long) p_conn->conn_idx,
+      p_conn->sock,
+      (unsigned long) p_conn->pollfd_idx);
+
+  if (p_conn->stage == STAGE_RESPONSE_START) {
+    char *selector = p_conn->buf, *raw_path = NULL, *log_msg;
+
+    if (asprintf(&raw_path, "%s/%s", g_config.srv_path, selector) < 0) {
+      log_pwarn(p_conn->addr_str, "Couldn't allocate resource path");
+      done = 1;
+      goto cleanup_response_start;
+    }
+
+    errno = 0;
+    if (sanitize_path(raw_path, &p_conn->path)) {
+      if (errno) {
+        switch (errno) {
+          case EACCES:
+          case EIO:
+          case ELOOP:
+          case ENAMETOOLONG:
+          case ENOENT:
+          case ENOTDIR:
+            log_msg = "Denied request: %s [%s] - %s";
+            p_conn->item_type = ITEM_TYPE_ERR;
+            break;
+
+          default:
+            log_pwarn(p_conn->addr_str, "Couldn't sanitize resource path");
+            done = 1;
+            goto cleanup_response_start;
+        }
+      } else {
+        log_msg = "Denied request: %s [%s] - Outside service path";
+        p_conn->item_type = ITEM_TYPE_ERR;
+      }
+    } else {
+      log_msg = "Allowed request: %s [%s]";
+    }
+
+    log_info(p_conn->addr_str, log_msg, selector,
+        p_conn->path ? p_conn->path : raw_path, strerror(errno));
+
+    if (!p_conn->item_type
+        && !(p_conn->item_type = get_item_type(p_conn->path))) {
+      log_pwarn(p_conn->addr_str, "Could not determine item type");
+      done = 1;
+      goto cleanup_response_start;
+    }
+
+    switch (p_conn->item_type) {
+    case ITEM_TYPE_ERR:
+      new_fail_response(p_conn);
+      break;
+
+    case ITEM_TYPE_DIR:
+      new_menu_response(p_conn);
+      break;
+
+    default:
+      new_file_response(p_conn);
+    }
+
+    if (p_conn->init_response(p_conn)) {
+      done = 1;
+      goto cleanup_response_start;
+    }
+
+    p_conn->stage = STAGE_RESPONSE_BODY;
+
+  cleanup_response_start:
+    free(raw_path);
+
+    if (done) {
+      goto cleanup;
+    }
+  }
+
+  if (!p_conn->data_size) {
+    p_conn->buf_next = p_conn->buf + p_conn->state_size;
+
+    if (p_conn->stage == STAGE_RESPONSE_EOM
+        || p_conn->buffer_response(p_conn)) {
+      done = 1;
+      goto cleanup;
+    }
+  }
+
+  buf_size = sizeof(p_conn->buf) - p_conn->state_size;
+
+  if (p_conn->data_size <= buf_size - RESPONSE_EOM_SIZE) {
+    if (is_item_type_textual(p_conn->item_type)) {
+      memcpy(p_conn->buf_next + p_conn->data_size, RESPONSE_EOM,
+          RESPONSE_EOM_SIZE);
+      p_conn->data_size += RESPONSE_EOM_SIZE;
+    }
+
+    p_conn->stage = STAGE_RESPONSE_EOM;
+  }
+
+  if ((send_size
+        = r_write(p_conn->sock, p_conn->buf_next, p_conn->data_size))
+      == -1) {
+    if (errno != EAGAIN && errno != EWOULDBLOCK) {
+      done = 1;
+    }
+
+    goto cleanup;
+  }
+
+  p_conn->buf_next += send_size;
+  p_conn->data_size -= send_size;
+
+cleanup:
+  if (done) {
+    handle_conn_delete(p_conn, p_pollfd);
+  }
+}
+
+static void handle_conn_read(struct conn *p_conn, struct pollfd *p_pollfd) {
+  /* Log some debug info. */
+  log_debug(NULL, "Reading connection %lu/socket %d (assigned pollfd %lu)",
+      (unsigned long) p_conn->conn_idx,
+      p_conn->sock,
+      (unsigned long) p_conn->pollfd_idx);
+
+  /* Parse the next portion of this client's request. */
+  switch (parse_request(p_conn)) {
+  case -1:
+    /* If an error occurred, bail out. */
+    handle_conn_delete(p_conn, p_pollfd);
+
+  case 0:
+    /* If no error occurred, but the request is not yet complete, try again
+     * when there's more data to be read. */
+    return;
+  }
+
+  /* Otherwise, no errors occurred and we got a complete selector. Now try to
+   * serve the requested resource. */
+  p_conn->stage = STAGE_RESPONSE_START;
+  p_pollfd->events = POLLOUT;
+  handle_conn_write(p_conn, p_pollfd);
+}
+
+static int handle_conn_new(int passive_sock) {
+  int ret = 0;
+  struct conn *p_conn = *(free_conn_top - 1);
+  struct pollfd *p_pollfd = conn_pollfds + num_active_conns;
+  struct sockaddr_in addr;
+  socklen_t addr_size = sizeof(addr);
+
+  /* Accept an incoming connection request. */
+  if ((p_conn->sock =
+        r_accept(passive_sock, (struct sockaddr *)&addr, &addr_size)) == -1) {
+    if (errno == EAGAIN || errno == EWOULDBLOCK) {
+      ret = 0;
+    } else {
+      log_perror(NULL, "Couldn't accept connection request");
+      ret = -1;
+    }
+    goto cleanup;
+  }
+
+  /* Format the client's IP address as a string. */
+  if (!inet_ntop(AF_INET, &addr.sin_addr, p_conn->addr_str,
+        sizeof(p_conn->addr_str))) {
+    log_perror(NULL, "Couldn't format remote IP address");
+    ret = -1;
+    goto cleanup;
+  }
+
+  /* Set the new connection's socket in nonblocking mode. */
+  if (fcntl(p_conn->sock, F_SETFL, O_NONBLOCK) == -1) {
+    log_perror(p_conn->addr_str,
+        "Couldn't put client socket in nonblocking mode");
+    ret = -1;
+    goto cleanup;
+  }
+
+  /* Update the pollfd--connection mapping table. */
+  pollfd_idxs_to_conns[num_active_conns] = p_conn;
+  p_conn->pollfd_idx = num_active_conns;
+
+  /* Log some debug info. */
+  log_debug(NULL, "Allocating pollfd %lu to connection %lu/socket %d",
+      (unsigned long) p_conn->pollfd_idx,
+      (unsigned long) p_conn->conn_idx,
+      p_conn->sock);
+
+cleanup:
+  if (!ret && p_conn->sock != -1) {
+    --free_conn_top;
+    ++num_active_conns;
+
+    p_conn->stage = STAGE_RESPONSE_START;
+    p_pollfd->fd = p_conn->sock;
+    p_pollfd->events = POLLIN;
+    p_pollfd->revents = 0;
+  } else if (ret == -1) {
+    cleanup_conn(p_conn);
+  }
+
+  return ret;
+}
+
+/***** Main worker functions: *****/
+
+/*
+ * "main function" for workers processes.
+ *
+ * Returns 0 on successful termination and a positive exit status on failure.
+ */
 static int worker_main(int passive_sock) {
   struct sigaction sig = { 0 };
 
   /* Print a message containing the worker's PID. */
   log_info(NULL, "Spawned worker process");
-
-  /* Ignore SIGPIPE so the worker doesn't die if the client closes the
-   * connection prematurely. */
-  sig.sa_handler = SIG_IGN;
-
-  if (sigaction(SIGPIPE, &sig, NULL)) {
-    log_perror(NULL, "Couldn't ignore SIGPIPE");
-    return 1;
-  }
 
   /* Make sure worker processes don't run as root. */
   if (!getuid()) {
@@ -488,32 +397,82 @@ static int worker_main(int passive_sock) {
     log_info(NULL, "Dropped root privileges; running as %s", g_config.user);
   }
 
+  /* Ignore SIGPIPE so the worker doesn't die if the client closes the
+   * connection prematurely. */
+  sig.sa_handler = SIG_IGN;
+
+  if (sigaction(SIGPIPE, &sig, NULL)) {
+    log_perror(NULL, "Couldn't ignore SIGPIPE");
+    return 1;
+  }
+
+  /* Allocate memory to store connection info. */
+  if (create_conn_state(passive_sock)) {
+    return 1;
+  }
+
   /* Process connections until we're asked to terminate cleanly. */
   while (!g_terminating) {
-    int conn_sock;
-    struct sockaddr_in addr;
-    socklen_t addr_buf = sizeof(addr);
-    char addr_str[INET_ADDRSTRLEN];
+    size_t i;
 
-    /* Accept an incoming connection request. */
-    if ((conn_sock = r_accept(passive_sock, (struct sockaddr *)&addr,
-            &addr_buf)) == -1) {
-      log_perror(NULL, "Couldn't accept connection request");
+    /* Poll the passive socket if and only if we've got room for another
+     * connection. */
+    p_passive_pollfd->events = (free_conn_top > free_conn_stack) ? POLLIN : 0;
+    p_passive_pollfd->revents = 0;
+
+    /* Wait until something socket-related happens. */
+    if (poll(pollfds, num_active_conns + 1, -1) == -1) {
+      if (errno == EINTR) {
+        continue;
+      }
+
+      log_perror(NULL, "Couldn't poll for socket events");
       return 1;
     }
 
-    /* Format the client's IP address as a string. */
-    if (!inet_ntop(AF_INET, &addr.sin_addr, addr_str, sizeof(addr_str))) {
-      log_perror(NULL, "Couldn't format remote IP address");
+    /* Check for incoming connection requests. */
+    if (p_passive_pollfd->revents & POLLIN) {
+      if (handle_conn_new(passive_sock)) {
+        return 1;
+      }
+    }
+
+    /* Check the passive socket for error conditions. */
+    if (p_passive_pollfd->revents & POLLERR) {
+      log_error(NULL, "Poll error on passive socket");
       return 1;
     }
 
-    /* Handle the new client connection. */
-    handle_conn(conn_sock, addr_str);
+    for (i = 0; i < num_active_conns; ++i) {
+      struct pollfd *p_pollfd = conn_pollfds + i;
+      struct conn *p_conn = pollfd_idxs_to_conns[i];
 
-    /* Close the client connection's socket. */
-    if (r_close(conn_sock)) {
-      log_perror(addr_str, "Couldn't close connection socket");
+      /* Check connected client sockets for IO conditions and/or errors. */
+      if (p_pollfd->revents & POLLIN) {
+        handle_conn_read(p_conn, p_pollfd);
+      }
+
+      if (p_pollfd->revents & POLLOUT) {
+        handle_conn_write(p_conn, p_pollfd);
+      }
+
+      if (p_pollfd->revents & POLLERR) {
+        log_error(p_conn->addr_str, "Poll error on connection socket");
+        handle_conn_delete(p_conn, p_pollfd);
+      }
+
+      /* Reset socket events. */
+      p_pollfd->revents = 0;
+
+      /* Stop monitoring client sockets when requests are served completely or
+       * errors occur. */
+      if (p_conn->stage == STAGE_FREE) {
+        /* If we deleted a connection, then its entry in the pollfds array has
+         * been replaced by the last active pollfd. The last active pollfd now
+         * lives at pollfds[i], and it might have events waiting. Therefore,
+         * we must check pollfds[i] *again* to avoid missing events. */
+        --i;
+      }
     }
   }
 
